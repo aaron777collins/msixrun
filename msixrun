@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# msixrun - install and launch an MSIX/APPX package from bash on Windows.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<USAGE
+msixrun $VERSION - install and launch an MSIX package from bash on Windows
+
+Usage: msixrun <file.msix|.msixbundle|.appx|.appxbundle> [--no-launch]
+
+Options:
+  --no-launch   install only, do not start the app
+  -h, --help    show this help
+  --version     show version
+USAGE
+}
+
+die() { echo "msixrun: error: $*" >&2; exit 1; }
+
+ps() { powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$1" | tr -d '\r'; }
+
+file="" launch=1
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)   usage; exit 0 ;;
+    --version)   echo "msixrun $VERSION"; exit 0 ;;
+    --no-launch) launch=0 ;;
+    -*)          die "unknown option: $arg (try --help)" ;;
+    *)           [ -z "$file" ] || die "only one package file allowed"; file="$arg" ;;
+  esac
+done
+
+[ -n "$file" ] || { usage >&2; exit 1; }
+[ -f "$file" ] || die "file not found: $file"
+case "$(printf '%s' "$file" | tr 'A-Z' 'a-z')" in
+  *.msix|*.msixbundle|*.appx|*.appxbundle) ;;
+  *) die "expected a .msix, .msixbundle, .appx or .appxbundle file: $file" ;;
+esac
+command -v powershell.exe >/dev/null 2>&1 || die "powershell.exe not found (run this on Windows: Git Bash, MSYS2 or WSL)"
+
+# 1. Convert to a Windows path.
+if command -v cygpath >/dev/null 2>&1; then
+  winpath="$(cygpath -w "$file")"
+elif command -v wslpath >/dev/null 2>&1; then
+  winpath="$(wslpath -w "$file")"
+else
+  die "need cygpath (Git Bash/MSYS2) or wslpath (WSL) to convert the path"
+fi
+psq="${winpath//\'/\'\'}"   # escape single quotes for PowerShell
+
+# 2. Read the package name from the manifest inside the package (it is a zip).
+echo "Reading package manifest..."
+pkgname="$(ps "
+\$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+\$zip = [IO.Compression.ZipFile]::OpenRead('$psq')
+try {
+  \$e = \$zip.Entries | Where-Object { \$_.FullName -in 'AppxManifest.xml','AppxMetadata/AppxBundleManifest.xml' } | Select-Object -First 1
+  if (-not \$e) { throw 'no AppxManifest.xml or AppxBundleManifest.xml found in package' }
+  \$r = New-Object IO.StreamReader(\$e.Open())
+  try { [xml]\$x = \$r.ReadToEnd() } finally { \$r.Dispose() }
+  if (\$x.Package) { \$x.Package.Identity.Name } else { \$x.Bundle.Identity.Name }
+} finally { \$zip.Dispose() }
+")" || die "could not read the package manifest"
+[ -n "$pkgname" ] || die "could not determine package name from manifest"
+echo "Package: $pkgname"
+
+# 3. Install.
+echo "Installing $winpath ..."
+if ! ps "Add-AppxPackage -Path '$psq'" >&2; then
+  cat >&2 <<HINT
+
+msixrun: install failed. If the message above mentions a signature or certificate
+(e.g. 0x800B0100), the package is probably unsigned or signed by an untrusted cert:
+  - Enable Developer Mode: Settings > System > For developers (Windows 11).
+  - Unsigned packages can only be installed on recent Windows builds that support
+    'Add-AppxPackage -AllowUnsigned' (run it manually in an elevated PowerShell).
+  - Or sign the package and trust its certificate.
+HINT
+  exit 1
+fi
+
+[ "$launch" -eq 1 ] || { echo "Installed $pkgname."; exit 0; }
+
+# 4. Look up PackageFamilyName and the first app Id, then launch.
+info="$(ps "
+\$ErrorActionPreference = 'Stop'
+\$p = Get-AppxPackage -Name '$pkgname' | Sort-Object { [version]\$_.Version } | Select-Object -Last 1
+if (-not \$p) { throw 'package not found after install' }
+\$id = @((Get-AppxPackageManifest \$p).Package.Applications.Application)[0].Id
+if (-not \$id) { throw 'package declares no launchable application' }
+\$p.PackageFamilyName + '!' + \$id
+")" || die "installed, but could not find the app to launch"
+[ -n "$info" ] || die "installed, but could not resolve PackageFamilyName!AppId"
+
+echo "Launching $info"
+# explorer.exe often returns a nonzero exit code even on success.
+explorer.exe "shell:AppsFolder\$info" || true
