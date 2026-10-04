@@ -43,7 +43,9 @@ psq() {
 }
 
 # ---- PowerShell snippets. Fixed text; the only value ever spliced in is the
-# ---- package path, through psq. Nothing read from the package is spliced in.
+# ---- package path, through psq. Only Base64 certificate bytes and the hex
+# ---- thumbprint of the signer are embedded in the elevated command, and both
+# ---- are checked there. No other text read from the package is spliced in.
 
 ps_id_fn() {
   cat <<'PS'
@@ -92,13 +94,13 @@ ps_signer() {
   cat <<'PS'
 # step: signer
 $ErrorActionPreference = 'Stop'
-function Clean($s) { ([string]$s) -replace '[\p{Cc}]+', ' ' }
+function Clean($s, $max) { $t = ([string]$s) -replace '[\p{Cc}\p{Cf}]', '?'; if ($t.Length -gt $max) { $t.Substring(0, $max) + '...' } else { $t } }
 $sig = Get-AuthenticodeSignature -FilePath $pkg
 'STATUS=' + $sig.Status
 $c = $sig.SignerCertificate
 if ($c) {
-  'SUBJECT=' + (Clean $c.Subject)
-  'THUMBPRINT=' + (Clean $c.Thumbprint)
+  'SUBJECT=' + (Clean $c.Subject 200)
+  'THUMBPRINT=' + (Clean $c.Thumbprint 64)
   'NOTAFTER=' + $c.NotAfter.ToString('yyyy-MM-dd')
 }
 PS
@@ -128,8 +130,11 @@ if (-not $cert) { 'MSIXRUN_RESULT=nocert'; exit 2 }
 $b64 = [Convert]::ToBase64String($cert.RawData)
 $inner = '$ErrorActionPreference = ''Stop''; try { $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String(''' + $b64 + ''')); if ($c.Thumbprint -ne ''' + (Q $cert.Thumbprint) + ''') { exit 1 }; $s = New-Object Security.Cryptography.X509Certificates.X509Store ''TrustedPeople'', ''LocalMachine''; $s.Open(''ReadWrite''); try { $s.Add($c) } finally { $s.Close() } } catch { exit 1 }'
 $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+# Full path: a relative name is looked up in the current directory first.
+$root = $env:SystemRoot; if (-not $root) { $root = 'C:\Windows' }
+$psexe = [IO.Path]::Combine($root, 'System32\WindowsPowerShell\v1.0\powershell.exe')
 try {
-  $p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
+  $p = Start-Process -FilePath $psexe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
 } catch {
   if (Declined $_.Exception) { 'MSIXRUN_RESULT=declined'; exit 3 }
   'MSIXRUN_RESULT=failed'
@@ -287,9 +292,10 @@ case "$src" in
     [ -f "$file" ] || die "file not found: $file"
     has_pkg_ext "$file" || die "expected a .msix, .msixbundle, .appx or .appxbundle file: $file"
     # Add-AppxPackage -Path and Get-AuthenticodeSignature -FilePath treat
-    # [ ] * ? as wildcards, so work from a plain copy.
+    # [ ] * ? as wildcards and ` as the escape character, so work from a
+    # plain copy.
     case "$file" in
-      *[][*?]*)
+      *[][*?\`]*)
         make_tmpdir
         copy="$tmpdir/$(printf '%s' "${file##*/}" | tr -c 'A-Za-z0-9._-' '_')"
         cp -- "$file" "$copy" || die "could not copy $file to a temp directory"
@@ -329,9 +335,18 @@ in_out() { printf '%s\n' "$out" | grep -qiE "$1"; }
 # Windows' own wording for each failure; codes come from the exception text.
 UNTRUSTED='0x800B0109|0x800B010A|0x800B0112|0x800B0004|root certificate of the signature|chain.*cannot be built'
 UNSIGNED='0x800B0100|must be digitally signed|not signed'
-# Only these mean another publisher's copy is in the way. Any other failure
+# Only this means another publisher's copy is in the way. Any other failure
 # (disk full, bad dependency, corrupt package) must never lead to a removal.
-CONFLICT='0x80073CFB|0x80073CF3'
+# 0x80073CF3 is Windows' generic "failed dependency or conflict validation"
+# code (a missing framework returns it too), so it counts only when the message
+# also says the package conflicts. A bare 0x80073CF3 never leads to a removal.
+CONFLICT='0x80073CFB'
+GENERIC_FAILURE='0x80073CF3'
+CONFLICT_WORDING='conflicts with|different publisher|another publisher'
+is_conflict() {
+  in_out "$CONFLICT" && return 0
+  in_out "$GENERIC_FAILURE" && in_out "$CONFLICT_WORDING"
+}
 
 trust_done=0 unsigned_done=0 conflict_done=0
 while :; do
@@ -407,7 +422,7 @@ HINT
   fi
 
   # 3c. An older copy from a different publisher is in the way.
-  if [ "$conflict_done" -eq 0 ] && in_out "$CONFLICT"; then
+  if [ "$conflict_done" -eq 0 ] && is_conflict; then
     run_ps ps_conflict
     if [ "$(field CONFLICT)" -gt 0 ] 2>/dev/null; then
       if confirm "An older $pkgname from a different publisher is installed. Remove it and install this one? Its local data will be removed. [y/N]" yes; then
@@ -441,4 +456,12 @@ esac
 
 echo "Launching $info"
 # explorer.exe often returns a nonzero exit code even on success.
-explorer.exe "shell:AppsFolder\\$info" || true
+# Prefer the full path under %SystemRoot%: a bare name could be a planted file.
+explorer="explorer.exe"
+if [ -n "${SYSTEMROOT:-}" ]; then
+  if command -v cygpath >/dev/null 2>&1; then sysroot="$(cygpath -u "$SYSTEMROOT" 2>/dev/null)" || sysroot=""
+  elif command -v wslpath >/dev/null 2>&1; then sysroot="$(wslpath -u "$SYSTEMROOT" 2>/dev/null)" || sysroot=""
+  else sysroot=""; fi
+  [ -z "$sysroot" ] || [ ! -x "$sysroot/explorer.exe" ] || explorer="$sysroot/explorer.exe"
+fi
+"$explorer" "shell:AppsFolder\\$info" || true

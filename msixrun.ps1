@@ -45,7 +45,12 @@ $script:UntrustedPattern = '0x800B0109|0x800B010A|0x800B0112|0x800B0004|root cer
 $script:UnsignedPattern  = '0x800B0100|must be digitally signed|not signed'
 # Only these mean "another publisher's copy is in the way". Anything else
 # (disk full, bad dependency, corrupt package) must never lead to a removal.
-$script:ConflictPattern  = '0x80073CFB|0x80073CF3'
+# 0x80073CF3 is Windows' generic "failed dependency or conflict validation"
+# code (a missing framework returns it too), so it counts only when the message
+# also says the package conflicts. A bare 0x80073CF3 never leads to a removal.
+$script:ConflictPattern  = '0x80073CFB'
+$script:GenericFailurePattern = '0x80073CF3'
+$script:ConflictWordingPattern = 'conflicts with|different publisher|another publisher'
 # Signature statuses that mean "validly signed, chain not trusted". Anything
 # else (HashMismatch, NotSigned, ...) is not offered for trust.
 $script:TrustableStatuses = @('UnknownError', 'NotTrusted')
@@ -120,6 +125,12 @@ function Test-AllowUnsignedSupported {
     return [bool]($cmd -and $cmd.Parameters.ContainsKey('AllowUnsigned'))
 }
 
+function Test-PublisherConflict {
+    param([string]$Failure)
+    if ($Failure -match $script:ConflictPattern) { return $true }
+    return ($Failure -match $script:GenericFailurePattern -and $Failure -match $script:ConflictWordingPattern)
+}
+
 function Test-PackageExtension {
     param([string]$Name)
     return ($Name -match '\.(msix|msixbundle|appx|appxbundle)$')
@@ -154,8 +165,9 @@ function Get-PackageFile {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { Write-MsixrunFatal "file not found: $Source" }
     if (-not (Test-PackageExtension $Source)) { Write-MsixrunFatal "expected a .msix, .msixbundle, .appx or .appxbundle file: $Source" }
     $full = (Resolve-Path -LiteralPath $Source).ProviderPath
-    # Add-AppxPackage -Path treats [ ] * ? as wildcards, so use a plain copy.
-    if ($full -match '[\[\]*?]') {
+    # Add-AppxPackage -Path treats [ ] * ? as wildcards and ` as the escape
+    # character, so use a plain copy.
+    if ($full -match '[\[\]*?`]') {
         $State.TempDir = Initialize-MsixrunTempDir
         $copy = Join-Path $State.TempDir ((Split-Path -Leaf $full) -replace '[^A-Za-z0-9._-]', '_')
         Copy-Item -LiteralPath $full -Destination $copy -ErrorAction Stop
@@ -216,6 +228,16 @@ function Install-Msix {
     }
 }
 
+# Text from the certificate, made safe to show in the consent prompt: control
+# and format characters (such as the bidi override U+202E) become '?', and
+# long values are cut.
+function Format-SignerText {
+    param([string]$Text, [int]$Max)
+    $t = [regex]::Replace($Text, '[\p{Cc}\p{Cf}]', '?')
+    if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + '...' }
+    return $t
+}
+
 function Get-SignerInfo {
     param([string]$Path)
     $sig = Get-AuthenticodeSignature -FilePath $Path
@@ -224,8 +246,8 @@ function Get-SignerInfo {
     return [pscustomobject]@{
         Status      = [string]$sig.Status
         Certificate = $c
-        Subject     = [regex]::Replace([string]$c.Subject, '\p{Cc}+', ' ')
-        Thumbprint  = [regex]::Replace([string]$c.Thumbprint, '\p{Cc}+', ' ')
+        Subject     = Format-SignerText ([string]$c.Subject) 200
+        Thumbprint  = Format-SignerText ([string]$c.Thumbprint) 64
         NotAfter    = $c.NotAfter.ToString('yyyy-MM-dd')
     }
 }
@@ -234,6 +256,16 @@ function Get-SignerInfo {
 function ConvertTo-PsQuoted {
     param([string]$Value)
     return [regex]::Replace($Value, '([''\u2018\u2019\u201A\u201B])', '$1$1')
+}
+
+# Full path under %SystemRoot%. A relative name would be looked up in the
+# current directory first, where a planted copy could run (elevated, for
+# powershell.exe).
+function Get-SystemExePath {
+    param([string]$Relative)
+    $root = $env:SystemRoot
+    if (-not $root) { $root = 'C:\Windows' }
+    return [IO.Path]::Combine($root, $Relative)
 }
 
 function Test-UacDeclined {
@@ -268,7 +300,7 @@ function Add-SignerTrust {
     $inner = (Get-CertVerifyScript -RawData $Signer.Certificate.RawData -Thumbprint $Signer.Thumbprint) + (Get-CertImportScript)
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
     try {
-        $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ErrorAction Stop `
+        $p = Start-Process -FilePath (Get-SystemExePath 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -Wait -PassThru -ErrorAction Stop `
             -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
     } catch {
         if (Test-UacDeclined $_.Exception) {
@@ -360,7 +392,7 @@ function Invoke-Msixrun {
             }
 
             # 3c. An older copy from a different publisher is in the way.
-            if (-not $conflictDone -and $failure -match $script:ConflictPattern) {
+            if (-not $conflictDone -and (Test-PublisherConflict $failure)) {
                 $old = @(Get-ConflictingPackage -Id $id)
                 if ($old.Count -gt 0) {
                     $ok = Confirm-Msixrun -Prompt "An older $name from a different publisher is installed. Remove it and install this one? Its local data will be removed. [y/N]" `
@@ -392,7 +424,7 @@ function Invoke-Msixrun {
         $info = [string]$installed.PackageFamilyName + '!' + [string]$appId
         if ($info -notmatch '^[A-Za-z0-9._-]+![A-Za-z0-9._-]+$') { Write-MsixrunFatal 'installed, but could not resolve PackageFamilyName!AppId' }
         Write-Host "Launching $info"
-        Start-Process -FilePath 'explorer.exe' -ArgumentList ('shell:AppsFolder\' + $info) -ErrorAction SilentlyContinue
+        Start-Process -FilePath (Get-SystemExePath 'explorer.exe') -ArgumentList ('shell:AppsFolder\' + $info) -ErrorAction SilentlyContinue
         return 0
     } catch {
         if ($_.Exception.Data['msixrun']) {
@@ -421,6 +453,6 @@ if ($MyInvocation.InvocationName -ne '.') {
         $code = @(Invoke-Msixrun -Source $Source -NoLaunch ([bool]$NoLaunch) -Trust ([bool]$Trust) -Yes ([bool]$Yes))[-1]
     }
     # A saved script can exit; in a scriptblock that would close the user's window.
-    if ($PSCommandPath) { exit $code }
+    if ($MyInvocation.MyCommand.CommandType -eq 'ExternalScript' -and $PSCommandPath -and $MyInvocation.MyCommand.Path -eq $PSCommandPath) { exit $code }
     $global:LASTEXITCODE = $code
 }

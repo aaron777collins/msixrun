@@ -53,6 +53,10 @@ BeforeAll {
         ([Security.Cryptography.HashAlgorithmName]::SHA256), ([Security.Cryptography.RSASignaturePadding]::Pkcs1)
     $script:TestCert = $req.CreateSelfSigned([DateTimeOffset]'2029-01-01T12:00:00Z', [DateTimeOffset]'2030-01-02T12:00:00Z')
 
+    # Absolute paths only: a bare name is looked up in the current directory first.
+    $script:PsExeRx = '^(?:[A-Za-z]:|/).*WindowsPowerShell.v1\.0.powershell\.exe$'
+    $script:ExplorerRx = '^(?:[A-Za-z]:|/).*explorer\.exe$'
+
     function Get-LogText { $script:Log -join "`n" }
     function Get-ElevatedCommand { [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($script:ElevatedArgs[4])) }
     function HResultOf([string]$hex) { [BitConverter]::ToInt32([BitConverter]::GetBytes([Convert]::ToUInt32($hex, 16)), 0) }
@@ -112,8 +116,8 @@ Describe 'msixrun.ps1' {
             $script:ElevatedArgs = $ArgumentList
             if ($script:ElevatedThrow) { throw $script:ElevatedThrow }
             [pscustomobject]@{ ExitCode = $script:ElevatedExit }
-        } -ParameterFilter { $FilePath -eq 'powershell.exe' }
-        Mock Start-Process { $script:Launched = $ArgumentList } -ParameterFilter { $FilePath -eq 'explorer.exe' }
+        } -ParameterFilter { $FilePath -match $script:PsExeRx }
+        Mock Start-Process { $script:Launched = $ArgumentList } -ParameterFilter { $FilePath -match $script:ExplorerRx }
         # A default is required (Pester 6 rejects a filtered mock without one):
         # everything but the certificate store goes to the real cmdlet.
         Mock Test-Path {
@@ -189,6 +193,13 @@ Describe 'msixrun.ps1' {
             $script:InstallArgs[0].Path | Should -Not -Match '[\[\]]'
             $script:InstallArgs[0].Path | Should -Not -Be $w
         }
+        It 'copies a path containing a backtick (the wildcard escape character) before installing' {
+            $dir = Join-Path $script:Work 'tick'
+            $w = New-TestMsix -Dir $dir -FileName 'app`1.msix'
+            (Invoke-Msixrun -Source $w -NoLaunch $true -Trust $false -Yes $false) | Should -Be 0
+            $script:InstallArgs[0].Path | Should -Not -Match '`'
+            $script:InstallArgs[0].Path | Should -Not -Be $w
+        }
     }
 
     Context 'URL source' {
@@ -226,7 +237,7 @@ Describe 'msixrun.ps1' {
             Get-LogText | Should -Match 'Signer:\s+CN=Acme Ltd, O=Acme'
             Get-LogText | Should -Match ('Thumbprint:\s+' + $script:TestCert.Thumbprint + ' \(SHA-1\)')
             Get-LogText | Should -Match ('Valid until: ' + $script:TestCert.NotAfter.ToString('yyyy-MM-dd'))
-            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'powershell.exe' -and $Verb -eq 'RunAs' -and $Wait -and $PassThru }
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -match $script:PsExeRx -and $Verb -eq 'RunAs' -and $Wait -and $PassThru }
             $script:ElevatedArgs[3] | Should -Be '-EncodedCommand'
             $inner = Get-ElevatedCommand
             $inner | Should -Match 'X509Store'
@@ -271,7 +282,7 @@ Describe 'msixrun.ps1' {
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $false) | Should -Be 0
             $script:Prompts.Count | Should -Be 0
             Get-LogText | Should -Match '\(-Trust\)'
-            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'powershell.exe' }
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -match $script:PsExeRx }
         }
         It '-Yes skips the prompt' {
             $script:Interactive = $false
@@ -283,13 +294,13 @@ Describe 'msixrun.ps1' {
             @{ code = '0x800B010A' }, @{ code = '0x800B0112' }, @{ code = '0x800B0004' }) {
             $script:InstallResults = @("Deployment failed with HRESULT: $code", $null)
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $false) | Should -Be 0
-            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'powershell.exe' }
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -match $script:PsExeRx }
         }
         It 'recognizes the code from the exception HResult alone' {
             $ex = New-Object System.Runtime.InteropServices.COMException 'Deployment failed', (HResultOf '800B0109')
             $script:InstallResults = @($ex, $null)
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $false) | Should -Be 0
-            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'powershell.exe' }
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -match $script:PsExeRx }
         }
         It 'recognizes the code from the message text alone' {
             $script:InstallResults = @('The root certificate of the signature in the app package must be trusted', $null)
@@ -337,7 +348,7 @@ Describe 'msixrun.ps1' {
             $script:InstallResults = @($script:Untrusted, $null)
             Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'NotTrusted'; SignerCertificate = $script:Signer } }
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $false) | Should -Be 0
-            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'powershell.exe' }
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -match $script:PsExeRx }
         }
         It 'the elevated verify step accepts the right thumbprint and refuses a different one' {
             $pwsh = (Get-Process -Id $PID).Path
@@ -362,7 +373,7 @@ Describe 'msixrun.ps1' {
             $script:InstallResults = @($script:Untrusted, $script:Untrusted, $script:Untrusted)
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $false -Trust $true -Yes $false) | Should -Be 1
             $script:InstallCalls | Should -Be 2
-            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -eq 'powershell.exe' }
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -match $script:PsExeRx }
             Get-LogText | Should -Match 'install failed'
         }
         It 'quotes the temp path safely inside the elevated command' {
@@ -436,13 +447,24 @@ Describe 'msixrun.ps1' {
                 PackageFullName = 'Acme.App_0.5.0.0_x64__oldhash'; PackageFamilyName = 'Acme.App_oldhash' })
         }
         It 'asks, removes the old one, and retries' -ForEach @(
-            @{ code = '0x80073CFB' }, @{ code = '0x80073CF3' }) {
+            @{ code = '0x80073CFB' }
+            @{ code = '0x80073CF3, Windows cannot install the package because it conflicts with an installed package from a different publisher' }) {
             $script:InstallResults = @("Deployment failed with HRESULT: $code", $null)
             $script:Answers.Enqueue('y')
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $false -Yes $false) | Should -Be 0
             $script:Prompts[0] | Should -Be 'An older Acme.App from a different publisher is installed. Remove it and install this one? Its local data will be removed. [y/N]'
             $script:Removed | Should -Be @('Acme.App_0.5.0.0_x64__oldhash')
             $script:InstallCalls | Should -Be 2
+        }
+        It 'never offers removal for a bare or dependency-only 0x80073CF3, even with -Yes' -ForEach @(
+            @{ msg = 'Deployment failed with HRESULT: 0x80073CF3' }
+            @{ msg = 'Deployment failed with HRESULT: 0x80073CF3, Package failed updates, dependency or conflict validation. Windows cannot install package Acme.App because this package depends on a framework that could not be found.' }) {
+            $script:InstallResults = @($msg, $null)
+            (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $true) | Should -Be 1
+            $script:Prompts.Count | Should -Be 0
+            $script:Removed.Count | Should -Be 0
+            @($script:Installed).Count | Should -Be 1
+            Get-LogText | Should -Match 'install failed'
         }
         It 'never offers removal for an unfamiliar error, even when another publisher''s copy exists' -ForEach @(
             @{ code = '0x80073D06' }, @{ code = '0x80070070' }) {
@@ -530,6 +552,12 @@ Describe 'msixrun.ps1' {
             $o = & $script:Pwsh -NoProfile -Command $cmd
             "$o" | Should -Match 'alive:1'
         }
+        It 'in scriptblock mode inside another saved script does not exit that script' {
+            $outer = Join-Path $script:Work 'outer.ps1'
+            Set-Content -LiteralPath $outer -Value ("& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '$($script:ScriptPath)'))) '$($script:Missing)' -NoLaunch -Trust -Yes`n'outer-continues:' + `$LASTEXITCODE")
+            $o = & $script:Pwsh -NoProfile -File $outer
+            "$o" | Should -Match 'outer-continues:1'
+        }
         It 'in scriptblock mode -Version leaves the host open with LASTEXITCODE 0' {
             $cmd = "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '$($script:ScriptPath)'))) -Version; 'alive:' + `$LASTEXITCODE"
             $o = & $script:Pwsh -NoProfile -Command $cmd
@@ -590,6 +618,18 @@ Describe 'msixrun.ps1 helpers' {
         Mock Get-Command { [pscustomobject]@{ Parameters = @{ Path = 1 } } }
         Test-AllowUnsignedSupported | Should -BeFalse
     }
+    It 'Format-SignerText replaces control and format characters (bidi override) and truncates' {
+        $s = "CN=Evil$([char]0x202E)gpj.exe$([char]0x0007)x"
+        Format-SignerText $s 200 | Should -Be 'CN=Evil?gpj.exe?x'
+        (Format-SignerText ('a' * 300) 200).Length | Should -Be 203
+    }
+    It 'Get-SystemExePath is rooted at SystemRoot, never a bare name' {
+        $old = $env:SystemRoot
+        try {
+            $env:SystemRoot = 'D:\Win'
+            Get-SystemExePath 'explorer.exe' | Should -Match '^D:.Win.explorer\.exe$'
+        } finally { $env:SystemRoot = $old }
+    }
     It 'Get-FailureText includes the HRESULT in hex' {
         $ex = New-Object System.Runtime.InteropServices.COMException 'boom', (HResultOf '800B0109')
         $text = try { throw $ex } catch { Get-FailureText $_ }
@@ -635,6 +675,139 @@ Describe 'msixrun (bash) PowerShell snippets' {
         [void][System.Management.Automation.Language.Parser]::ParseInput($inner, [ref]$null, [ref]$errs)
         $errs | Should -BeNullOrEmpty
         $inner | Should -Match ([regex]::Escape($b64))
+    }
+    Context 'executed with the Windows commands replaced' {
+        BeforeAll {
+            $script:Pwsh = (Get-Process -Id $PID).Path
+            $script:CertB64 = [Convert]::ToBase64String($script:TestCert.RawData)
+            $script:Log2 = Join-Path $script:Work 'snippet-calls.log'
+            # Runs a snippet in a child PowerShell. $Prelude defines the mocks
+            # (functions win over cmdlets). Returns the output lines and exit code.
+            function Invoke-Snippet {
+                param([string]$Name, [string]$Prelude = '', [string]$Pkg = 'C:\fake\app.msix')
+                Remove-Item -LiteralPath $script:Log2 -ErrorAction SilentlyContinue
+                $text = @(
+                    "`$global:CallLog = '" + $script:Log2.Replace("'", "''") + "'"
+                    "`$global:Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String('$($script:CertB64)'))"
+                    "function Get-Hr([string]`$h) { [BitConverter]::ToInt32([BitConverter]::GetBytes([Convert]::ToUInt32(`$h, 16)), 0) }"
+                    $Prelude
+                    "`$pkg = '" + $Pkg.Replace("'", "''") + "'"
+                    (Get-SnippetBody $Name)
+                ) -join "`n"
+                $f = Join-Path $script:Work ('snippet-' + [guid]::NewGuid().ToString('N') + '.ps1')
+                Set-Content -LiteralPath $f -Value $text
+                $o = & $script:Pwsh -NoProfile -File $f 2>&1
+                [pscustomobject]@{ Lines = @($o | ForEach-Object { "$_" }); Code = $LASTEXITCODE }
+            }
+            $script:SignerMock = 'function Get-AuthenticodeSignature { param($FilePath) [pscustomobject]@{ Status = ''UnknownError''; SignerCertificate = $global:Cert } }'
+            $script:StartMock = 'function Start-Process { param($FilePath, $Verb, [switch]$Wait, [switch]$PassThru, $ArgumentList) Set-Content -LiteralPath $global:CallLog -Value $FilePath; %BODY% }'
+            $script:TestPathMock = 'function Test-Path { param($Path) %BODY% }'
+        }
+        It 'ps_install: success prints MSIXRUN_OK and passes -AllowUnsigned only when asked' {
+            $mock = 'function Add-AppxPackage { param($Path, [switch]$AllowUnsigned) Add-Content -LiteralPath $global:CallLog -Value ("unsigned=" + [bool]$AllowUnsigned) }'
+            $r = Invoke-Snippet -Name ps_install -Prelude ($mock + "`n`$allowUnsigned = `$false")
+            $r.Code | Should -Be 0
+            $r.Lines | Should -Contain 'MSIXRUN_OK'
+            (Get-Content -LiteralPath $script:Log2) | Should -Be 'unsigned=False'
+            $r = Invoke-Snippet -Name ps_install -Prelude ($mock + "`n`$allowUnsigned = `$true")
+            (Get-Content -LiteralPath $script:Log2) | Should -Be 'unsigned=True'
+        }
+        It 'ps_install: failure prints the HRESULT in hex and the message, and exits 1' {
+            $mock = 'function Add-AppxPackage { param($Path, [switch]$AllowUnsigned) throw (New-Object Runtime.InteropServices.COMException "Deployment failed`n  with conflict", (Get-Hr ''0x80073CFB'')) }' + "`n`$allowUnsigned = `$false"
+            $r = Invoke-Snippet -Name ps_install -Prelude $mock
+            $r.Code | Should -Be 1
+            $r.Lines | Should -Contain 'MSIXRUN_HRESULT=0x80073CFB'
+            ($r.Lines | Where-Object { $_ -like 'MSIXRUN_MESSAGE=Deployment failed with conflict*' }) | Should -Not -BeNullOrEmpty
+            $r.Lines | Should -Not -Contain 'MSIXRUN_OK'
+        }
+        It 'ps_signer: prints status, strips control and bidi characters, truncates' {
+            $mock = 'function Get-AuthenticodeSignature { param($FilePath) [pscustomobject]@{ Status = ''NotTrusted''; SignerCertificate = [pscustomobject]@{ Subject = ("CN=Evil" + [char]0x202E + "gpj" + [char]7 + ("x" * 300)); Thumbprint = "AABB"; NotAfter = [datetime]''2030-01-02'' } } }'
+            $r = Invoke-Snippet -Name ps_signer -Prelude $mock
+            $r.Code | Should -Be 0
+            $r.Lines | Should -Contain 'STATUS=NotTrusted'
+            $r.Lines | Should -Contain 'THUMBPRINT=AABB'
+            $r.Lines | Should -Contain 'NOTAFTER=2030-01-02'
+            $subject = ($r.Lines | Where-Object { $_ -like 'SUBJECT=*' })
+            $subject | Should -Match '^SUBJECT=CN=Evil\?gpj\?x+\.\.\.$'
+            $subject.Length | Should -Be (8 + 203)
+        }
+        It 'ps_trust: success starts the absolute powershell.exe elevated and verifies the store' {
+            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 0
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=ok'
+            (Get-Content -LiteralPath $script:Log2) | Should -Match $script:PsExeRx
+        }
+        It 'ps_trust: a declined UAC prompt gives declined and exit 3' {
+            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', 'throw (New-Object ComponentModel.Win32Exception 1223)') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 3
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=declined'
+        }
+        It 'ps_trust: another start failure gives failed, the message, and exit 4' {
+            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', 'throw ''no elevation available''') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 4
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=failed'
+            $r.Lines | Should -Contain 'MSIXRUN_MESSAGE=no elevation available'
+        }
+        It 'ps_trust: a nonzero exit from the elevated import gives failed and exit 4' {
+            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 1 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 4
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=failed'
+            $r.Lines | Should -Contain 'MSIXRUN_MESSAGE=the elevated import exited with code 1'
+        }
+        It 'ps_trust: a certificate missing from the store afterwards gives unverified and exit 5' {
+            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$false')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 5
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=unverified'
+        }
+        It 'ps_trust: a package with no signer certificate gives nocert and exit 2, with no elevation' {
+            $mock = 'function Get-AuthenticodeSignature { param($FilePath) [pscustomobject]@{ Status = ''NotSigned''; SignerCertificate = $null } }' + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 2
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=nocert'
+            Test-Path -LiteralPath $script:Log2 | Should -BeFalse
+        }
+        It 'ps_conflict and ps_remove only touch copies from a different publisher' {
+            $pkgPath = New-TestMsix -Dir (Join-Path $script:Work 'conf') -Name 'Acme.App' -Publisher 'CN=Acme'
+            $mock = @(
+                'function Get-AppxPackage { param($Name) @([pscustomobject]@{ Name = ''Acme.App''; Publisher = ''CN=Acme''; PackageFullName = ''same'' }, [pscustomobject]@{ Name = ''Acme.App''; Publisher = ''CN=Other''; PackageFullName = ''other'' }) }'
+                'function Remove-AppxPackage { param($Package) Add-Content -LiteralPath $global:CallLog -Value $Package }'
+            ) -join "`n"
+            $r = Invoke-Snippet -Name ps_conflict -Prelude $mock -Pkg $pkgPath
+            $r.Lines | Should -Contain 'CONFLICT=1'
+            $r = Invoke-Snippet -Name ps_remove -Prelude $mock -Pkg $pkgPath
+            $r.Code | Should -Be 0
+            $r.Lines | Should -Contain 'REMOVED=1'
+            @(Get-Content -LiteralPath $script:Log2) | Should -Be @('other')
+        }
+        It 'ps_remove: a removal failure prints the message and exits 1' {
+            $pkgPath = New-TestMsix -Dir (Join-Path $script:Work 'conf2') -Name 'Acme.App' -Publisher 'CN=Acme'
+            $mock = @(
+                'function Get-AppxPackage { param($Name) @([pscustomobject]@{ Name = ''Acme.App''; Publisher = ''CN=Other''; PackageFullName = ''other'' }) }'
+                'function Remove-AppxPackage { param($Package) throw ''in use'' }'
+            ) -join "`n"
+            $r = Invoke-Snippet -Name ps_remove -Prelude $mock -Pkg $pkgPath
+            $r.Code | Should -Be 1
+            $r.Lines | Should -Contain 'MSIXRUN_MESSAGE=in use'
+        }
+        It 'ps_launch prints PackageFamilyName!AppId of the newest install' {
+            $pkgPath = New-TestMsix -Dir (Join-Path $script:Work 'conf3') -Name 'Acme.App' -Publisher 'CN=Acme'
+            $mock = @(
+                'function Get-AppxPackage { param($Name) @([pscustomobject]@{ Version = ''1.0.0.0''; PackageFamilyName = ''Old_x'' }, [pscustomobject]@{ Version = ''2.0.0.0''; PackageFamilyName = ''Acme.App_8wekyb3d8bbwe'' }) }'
+                'function Get-AppxPackageManifest { param($Package) [pscustomobject]@{ Package = [pscustomobject]@{ Applications = [pscustomobject]@{ Application = @([pscustomobject]@{ Id = ''App'' }) } } } }'
+            ) -join "`n"
+            $r = Invoke-Snippet -Name ps_launch -Prelude $mock -Pkg $pkgPath
+            $r.Code | Should -Be 0
+            $r.Lines[-1] | Should -Be 'Acme.App_8wekyb3d8bbwe!App'
+        }
+        It 'the bash script launches explorer.exe and powershell.exe by full path or through the shell only' {
+            $script:BashText | Should -Not -Match "Start-Process -FilePath powershell\.exe"
+            $script:BashText | Should -Match ([regex]::Escape('$psexe = [IO.Path]::Combine($root, ''System32\WindowsPowerShell\v1.0\powershell.exe'')'))
+        }
     }
     It 'ps_manifest really reads Name and Publisher from a package' {
         $pkgPath = New-TestMsix -Dir (Join-Path $script:Work 'snip') -Name 'Snip.App' -Publisher 'CN=Snip'

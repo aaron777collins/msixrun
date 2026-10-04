@@ -166,6 +166,10 @@ cp "$T/app.msix" "$T/app[1]*?.msix"; run_msixrun 'app[1]*?.msix' --no-launch
 assert_rc 0; assert_file_has "$T/script.install.1" 'C:\fake\app_1___.msix'
 assert_file_has "$T/script.manifest.1" 'C:\fake\app_1___.msix'
 [ -z "$(ls "$T/tmp")" ] && ok || bad "temp copy not cleaned up: $(ls "$T/tmp")"
+new_test "path with a backtick is copied to a plain name first"
+cp "$T/app.msix" "$T/app\`1.msix"; run_msixrun 'app`1.msix' --no-launch
+assert_rc 0; assert_file_has "$T/script.install.1" 'C:\fake\app_1.msix'
+[ -z "$(ls "$T/tmp")" ] && ok || bad "temp copy not cleaned up: $(ls "$T/tmp")"
 new_test "path without wildcard characters is used in place"
 run_msixrun app.msix --no-launch
 assert_rc 0; assert_file_has "$T/script.install.1" "\$pkg = 'C:\\fake\\app.msix'"
@@ -361,9 +365,20 @@ run_msixrun app.msix --no-launch
 assert_rc 0
 assert_out "An older Acme.App from a different publisher is installed. Remove it and install this one? Its local data will be removed. [y/N]"
 assert_steps "manifest install conflict remove install"
-new_test "older copy, error 0x80073CF3"
-printf '0x80073CF3\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers y
+new_test "older copy, 0x80073CF3 with conflict wording"
+printf '0x80073CF3 the package conflicts with an installed one\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers y
 run_msixrun app.msix --no-launch; assert_rc 0; assert_step remove
+new_test "older copy, 0x80073CF3 saying a different publisher"
+printf '0x80073CF3 installed from a different publisher\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers y
+run_msixrun app.msix --no-launch; assert_rc 0; assert_step remove
+new_test "bare 0x80073CF3 (a dependency failure) never removes an older copy, even with --yes"
+printf '0x80073CF3\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
+run_msixrun app.msix --yes --no-launch
+assert_rc 1; assert_out "install failed"; assert_no_step conflict; assert_no_step remove; assert_not_out "Remove it"; assert_count install 1
+new_test "0x80073CF3 with only Windows' generic 'dependency or conflict validation' text never removes"
+printf '0x80073CF3 Package failed updates, dependency or conflict validation. depends on a framework that could not be found\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
+run_msixrun app.msix --yes --no-launch
+assert_rc 1; assert_no_step remove; assert_no_step conflict
 new_test "unfamiliar error never offers to remove an older copy, even when one exists"
 printf '0x80073D06\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers y
 run_msixrun app.msix --no-launch
@@ -408,6 +423,11 @@ assert_rc 0; assert_steps "manifest install signer trust install conflict remove
 
 # ---------------------------------------------------------------- script shape
 
+new_test "the elevated step starts powershell.exe by full path"
+printf '%s\n' "$UNTRUSTED" >"$T/install.seq"; printf 'ok\n' >>"$T/install.seq"; no_tty
+run_msixrun app.msix --trust --no-launch
+assert_rc 0; assert_file_has "$T/script.trust.1" "[IO.Path]::Combine(\$root, 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')"
+if grep -qF -- 'Start-Process -FilePath powershell.exe' "$T/script.trust.1"; then bad "bare powershell.exe in trust step"; else ok; fi
 new_test "package-derived strings are never spliced into PowerShell"
 printf 'NAME=Acme.App\nPUBLISHER=CN=Evil'"'"'; calc; #\n' >"$T/manifest.out"
 printf '0x80073CFB\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
