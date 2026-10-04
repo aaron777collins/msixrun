@@ -40,16 +40,24 @@ param(
 
 $script:MsixrunVersion = '1.1.0'
 
-# Windows' own wording for each failure; the codes come from the exception text.
-$script:UntrustedPattern = '0x800B0109|0x800B010A|0x800B0112|0x800B0004|root certificate of the signature|chain.*cannot be built'
-$script:UnsignedPattern  = '0x800B0100|must be digitally signed|not signed'
-# Only these mean "another publisher's copy is in the way". Anything else
+# Failures are classified on the deployment HRESULT that Windows prints in its
+# message ("Deployment failed with HRESULT: 0x..."), after the package path and
+# file name have been removed from the text (a file named 0x80073CFB.msix must
+# not look like an error code). Only when the message holds no HRESULT at all
+# does the wording decide. The HResult property of the .NET exception is NOT
+# the deployment HRESULT (it is usually a generic 0x80131509), so it counts
+# only as a last resort when the message has no code.
+$script:UntrustedCodes   = @('0X800B0109', '0X800B010A', '0X800B0112', '0X800B0004')
+$script:UntrustedWording = 'root certificate of the signature|chain.*cannot be built'
+$script:UnsignedCodes    = @('0X800B0100')
+$script:UnsignedWording  = 'must be digitally signed|not signed'
+# Only 0x80073CFB means "another publisher's copy is in the way". Anything else
 # (disk full, bad dependency, corrupt package) must never lead to a removal.
 # 0x80073CF3 is Windows' generic "failed dependency or conflict validation"
 # code (a missing framework returns it too), so it counts only when the message
 # also says the package conflicts. A bare 0x80073CF3 never leads to a removal.
-$script:ConflictPattern  = '0x80073CFB'
-$script:GenericFailurePattern = '0x80073CF3'
+$script:ConflictCode = '0X80073CFB'
+$script:GenericFailureCode = '0X80073CF3'
 $script:ConflictWordingPattern = 'conflicts with|different publisher|another publisher'
 # Signature statuses that mean "validly signed, chain not trusted". Anything
 # else (HashMismatch, NotSigned, ...) is not offered for trust.
@@ -125,10 +133,46 @@ function Test-AllowUnsignedSupported {
     return [bool]($cmd -and $cmd.Parameters.ContainsKey('AllowUnsigned'))
 }
 
+$script:ExceptionMarker = ' [exception HResult:'
+
+# The deployment HRESULT in a failure text: the one after "HRESULT:" if there
+# is one, otherwise the first 0x........ token, looking only at the message
+# (the part before the exception-HResult marker). $null when there is none.
+function Get-FailureCode {
+    param([string]$Text)
+    $msg = $Text.Split([string[]]@($script:ExceptionMarker), 'None')[0]
+    $m = [regex]::Match($msg, 'HRESULT:?\s*(0x[0-9A-Fa-f]{8})')
+    if ($m.Success) { return $m.Groups[1].Value.ToUpperInvariant() }
+    $m = [regex]::Match($msg, '0x[0-9A-Fa-f]{8}')
+    if ($m.Success) { return $m.Value.ToUpperInvariant() }
+    return $null
+}
+
+# The .NET HResult codes of the exceptions, after the marker. Last resort only.
+function Get-ExceptionCode {
+    param([string]$Text)
+    $i = $Text.IndexOf($script:ExceptionMarker)
+    if ($i -lt 0) { return @() }
+    return @([regex]::Matches($Text.Substring($i), '0x[0-9A-Fa-f]{8}') | ForEach-Object { $_.Value.ToUpperInvariant() })
+}
+
+# Does the failure text belong to a kind? The message's code decides when there
+# is one. With no code in the message, the wording decides, or an exception
+# HResult that is itself one of the kind's codes.
+function Test-FailureKind {
+    param([string]$Failure, [string[]]$Codes, [string]$Wording)
+    $code = Get-FailureCode $Failure
+    if ($code) { return ($Codes -contains $code) }
+    if (@(Get-ExceptionCode $Failure | Where-Object { $Codes -contains $_ }).Count -gt 0) { return $true }
+    return ($Failure.Split([string[]]@($script:ExceptionMarker), 'None')[0] -match $Wording)
+}
+
 function Test-PublisherConflict {
     param([string]$Failure)
-    if ($Failure -match $script:ConflictPattern) { return $true }
-    return ($Failure -match $script:GenericFailurePattern -and $Failure -match $script:ConflictWordingPattern)
+    $code = Get-FailureCode $Failure
+    if (-not $code) { $code = @(Get-ExceptionCode $Failure | Where-Object { $_ -in @($script:ConflictCode, $script:GenericFailureCode) })[0] }
+    if ($code -eq $script:ConflictCode) { return $true }
+    return ($code -eq $script:GenericFailureCode -and $Failure -match $script:ConflictWordingPattern)
 }
 
 function Test-PackageExtension {
@@ -199,21 +243,38 @@ function Get-MsixId {
     }
 }
 
-# All the text Windows gave us about a failure, with the HRESULT in hex.
+# Remove every spelling of the package's path and file name from a text, so a
+# package called 0x80073CFB.msix cannot pass for an error code.
+function Get-TextWithoutPackage {
+    param([string]$Text, [string]$Path)
+    $names = @($Path, $Path.Replace('\', '/'), ($Path -split '[\\/]')[-1]) | Where-Object { $_ } | Sort-Object { $_.Length } -Descending
+    foreach ($n in $names) {
+        $Text = [regex]::Replace($Text, [regex]::Escape($n), '<package>', 'IgnoreCase')
+    }
+    return $Text
+}
+
+# All the text Windows gave us about a failure. The messages come first. The
+# .NET HResult of each exception is appended in hex as a last resort only: it
+# is not the deployment HRESULT (that is in the message), so a code in the
+# message always wins in Get-FailureCode.
 function Get-FailureText {
-    param($ErrorRecord)
+    param($ErrorRecord, [string]$Path)
     $parts = New-Object System.Collections.Generic.List[string]
+    $codes = New-Object System.Collections.Generic.List[string]
     $ex = $ErrorRecord.Exception
     while ($ex) {
         $parts.Add([string]$ex.Message)
-        try { $parts.Add(('0x{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$ex.HResult), 0))) } catch { Write-Verbose 'exception has no HResult' }
+        try { $codes.Add(('0x{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$ex.HResult), 0))) } catch { Write-Verbose 'exception has no HResult' }
         $ex = $ex.InnerException
     }
     $parts.Add([string]$ErrorRecord.FullyQualifiedErrorId)
-    return (($parts -join ' ') -replace '\s+', ' ')
+    $text = ($parts -join ' ')
+    if ($Path) { $text = Get-TextWithoutPackage -Text $text -Path $Path }
+    return ((($text -replace '\s+', ' ') + $script:ExceptionMarker + ' ' + ($codes -join ' ') + ']'))
 }
 
-# Returns $null on success, or the failure text.
+# Returns $null on success, or the failure text (package path removed).
 function Install-Msix {
     param([string]$Path, [bool]$AllowUnsigned)
     try {
@@ -224,7 +285,7 @@ function Install-Msix {
         }
         return $null
     } catch {
-        return (Get-FailureText $_)
+        return (Get-FailureText -ErrorRecord $_ -Path $Path)
     }
 }
 
@@ -278,13 +339,14 @@ function Test-UacDeclined {
     return $false
 }
 
-# The script run by the elevated child. It carries the certificate bytes
-# itself (Base64 of the DER data) and refuses to import anything whose
-# thumbprint is not the expected one, so no file on disk is ever trusted.
+# The script run by the elevated child. It receives no certificate bytes, only
+# the path of a .cer file and the SHA-1 thumbprint the user was shown. It loads
+# the file, recomputes the thumbprint, and exits 1 unless it equals the
+# expected one, so a swapped file is never imported.
 function Get-CertVerifyScript {
-    param([byte[]]$RawData, [string]$Thumbprint)
-    $b64 = [Convert]::ToBase64String($RawData)
-    return '$ErrorActionPreference = ''Stop''; try { $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String(''' + $b64 + ''')); if ($c.Thumbprint -ne ''' + (ConvertTo-PsQuoted $Thumbprint) + ''') { exit 1 }; '
+    param([string]$CerPath, [string]$Thumbprint)
+    if ($Thumbprint -cnotmatch '^[0-9A-F]{40}$') { throw 'the thumbprint is not 40 uppercase hex characters' }
+    return '$ErrorActionPreference = ''Stop''; try { $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,''' + (ConvertTo-PsQuoted $CerPath) + '''); if ($c.Thumbprint -ne ''' + $Thumbprint + ''') { exit 1 }; '
 }
 
 function Get-CertImportScript {
@@ -292,24 +354,38 @@ function Get-CertImportScript {
 }
 
 # Import THIS package's signer certificate into LocalMachine\TrustedPeople in
-# one elevated child. The child's command is passed as -EncodedCommand (Base64
+# one elevated child. This (non-elevated) side exports the certificate to a
+# temp .cer and passes only its path and the expected thumbprint, so the
+# command stays small and carries no certificate bytes. The thumbprint is the
+# one the user was shown; it must be 40 uppercase hex characters and match the
+# certificate in hand. The child's command is passed as -EncodedCommand (Base64
 # of UTF-16LE), so no text is ever parsed as part of a command line. Never the
 # Root store.
 function Add-SignerTrust {
     param($Signer)
-    $inner = (Get-CertVerifyScript -RawData $Signer.Certificate.RawData -Thumbprint $Signer.Thumbprint) + (Get-CertImportScript)
-    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+    $cert = $Signer.Certificate
+    $thumb = [string]$cert.Thumbprint
+    if ($thumb -cnotmatch '^[0-9A-F]{40}$') { Write-MsixrunFatal 'the signer certificate has an unexpected thumbprint, so nothing was trusted.' }
+    if ($thumb -ne $Signer.Thumbprint) { Write-MsixrunFatal 'the signer certificate is not the one you were shown, so nothing was trusted.' }
+    $cer = Join-Path ([IO.Path]::GetTempPath()) ('msixrun-' + [guid]::NewGuid().ToString('N') + '.cer')
     try {
-        $p = Start-Process -FilePath (Get-SystemExePath 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -Wait -PassThru -ErrorAction Stop `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
-    } catch {
-        if (Test-UacDeclined $_.Exception) {
-            Write-MsixrunFatal "permission was declined, so $($Signer.Subject) was not trusted. Nothing was changed."
+        [IO.File]::WriteAllBytes($cer, $cert.RawData)
+        $inner = (Get-CertVerifyScript -CerPath $cer -Thumbprint $thumb) + (Get-CertImportScript)
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+        try {
+            $p = Start-Process -FilePath (Get-SystemExePath 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -Wait -PassThru -ErrorAction Stop `
+                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
+        } catch {
+            if (Test-UacDeclined $_.Exception) {
+                Write-MsixrunFatal "permission was declined, so $($Signer.Subject) was not trusted. Nothing was changed."
+            }
+            Write-MsixrunFatal "could not start the elevated step: $($_.Exception.Message)"
         }
-        Write-MsixrunFatal "could not start the elevated step: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $cer -Force -ErrorAction SilentlyContinue
     }
     if ($p.ExitCode -ne 0) { Write-MsixrunFatal "could not trust the certificate: the elevated import exited with code $($p.ExitCode)" }
-    if (-not (Test-Path -LiteralPath ('Cert:\LocalMachine\TrustedPeople\' + $Signer.Thumbprint))) {
+    if (-not (Test-Path -LiteralPath ('Cert:\LocalMachine\TrustedPeople\' + $thumb))) {
         Write-MsixrunFatal 'the certificate import ran but the thumbprint is not in Trusted People. Nothing was installed.'
     }
 }
@@ -347,7 +423,7 @@ function Invoke-Msixrun {
             if ($null -eq $failure) { break }
 
             # 3a. The publisher is not trusted.
-            if ($failure -match $script:UntrustedPattern -and -not $trustDone) {
+            if (-not $trustDone -and (Test-FailureKind -Failure $failure -Codes $script:UntrustedCodes -Wording $script:UntrustedWording)) {
                 $signer = Get-SignerInfo -Path $pkg
                 if (-not $signer) { Write-MsixrunFatal "Windows does not trust this package's publisher, and msixrun could not read the signer certificate: $failure" }
                 if ($script:TrustableStatuses -notcontains $signer.Status) {
@@ -371,7 +447,7 @@ function Invoke-Msixrun {
             }
 
             # 3b. The package is not signed at all.
-            if ($failure -match $script:UnsignedPattern -and -not $unsignedDone) {
+            if (-not $unsignedDone -and (Test-FailureKind -Failure $failure -Codes $script:UnsignedCodes -Wording $script:UnsignedWording)) {
                 $dev = Test-DeveloperMode
                 $canUnsigned = Test-AllowUnsignedSupported
                 if ($dev -and $canUnsigned) {

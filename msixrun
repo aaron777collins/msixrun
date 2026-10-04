@@ -42,10 +42,10 @@ psq() {
   printf '%s' "$s"
 }
 
-# ---- PowerShell snippets. Fixed text; the only value ever spliced in is the
-# ---- package path, through psq. Only Base64 certificate bytes and the hex
-# ---- thumbprint of the signer are embedded in the elevated command, and both
-# ---- are checked there. No other text read from the package is spliced in.
+# ---- PowerShell snippets. Fixed text; the only values ever spliced in are the
+# ---- package path, through psq, and (for the trust step) the signer's SHA-1
+# ---- thumbprint, which bash has checked to be 40 uppercase hex characters.
+# ---- No other text read from the package is spliced in.
 
 ps_id_fn() {
   cat <<'PS'
@@ -83,7 +83,9 @@ try {
   'MSIXRUN_OK'
 } catch {
   $h = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$_.Exception.HResult), 0)
-  'MSIXRUN_HRESULT=0x{0:X8}' -f $h
+  # The .NET exception's HResult. It is NOT the deployment HRESULT (that is in
+# the message), so bash uses it only when the message holds no code.
+'MSIXRUN_HRESULT=0x{0:X8}' -f $h
   'MSIXRUN_MESSAGE=' + (($_.Exception.Message + ' ' + $_.FullyQualifiedErrorId) -replace '\s+', ' ')
   exit 1
 }
@@ -107,11 +109,13 @@ PS
 }
 
 # Import THIS package's signer certificate into LocalMachine\TrustedPeople in
-# one elevated child. The certificate bytes travel inside the child's command
-# (Base64 of the DER data, checked against the expected thumbprint before the
-# import), so no file on disk is ever trusted. The command is passed as
-# -EncodedCommand (Base64 of UTF-16LE), so no text is parsed as part of a
-# command line.
+# one elevated child. $expectedThumb is the thumbprint the user was shown. The
+# signer is read again here and nothing happens unless its thumbprint equals
+# $expectedThumb and its status is still UnknownError or NotTrusted. The
+# certificate is exported to a temp .cer by this non-elevated side; the elevated
+# child gets only that path and the thumbprint (through -EncodedCommand, Base64
+# of UTF-16LE, so no text is parsed as part of a command line), reloads the
+# file, recomputes the thumbprint and refuses unless it matches.
 ps_trust() {
   cat <<'PS'
 # step: trust
@@ -127,23 +131,31 @@ function Declined($e) {
 $sig = Get-AuthenticodeSignature -FilePath $pkg
 $cert = $sig.SignerCertificate
 if (-not $cert) { 'MSIXRUN_RESULT=nocert'; exit 2 }
-$b64 = [Convert]::ToBase64String($cert.RawData)
-$inner = '$ErrorActionPreference = ''Stop''; try { $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String(''' + $b64 + ''')); if ($c.Thumbprint -ne ''' + (Q $cert.Thumbprint) + ''') { exit 1 }; $s = New-Object Security.Cryptography.X509Certificates.X509Store ''TrustedPeople'', ''LocalMachine''; $s.Open(''ReadWrite''); try { $s.Add($c) } finally { $s.Close() } } catch { exit 1 }'
-$enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-# Full path: a relative name is looked up in the current directory first.
-$root = $env:SystemRoot; if (-not $root) { $root = 'C:\Windows' }
-$psexe = [IO.Path]::Combine($root, 'System32\WindowsPowerShell\v1.0\powershell.exe')
+if ($expectedThumb -cnotmatch '^[0-9A-F]{40}$' -or $cert.Thumbprint -ne $expectedThumb -or @('UnknownError', 'NotTrusted') -notcontains [string]$sig.Status) { 'MSIXRUN_RESULT=changed'; exit 6 }
+$cer = [IO.Path]::Combine([IO.Path]::GetTempPath(), 'msixrun-' + [guid]::NewGuid().ToString('N') + '.cer')
+$result = 'ok'; $msg = ''
 try {
-  $p = Start-Process -FilePath $psexe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
+  [IO.File]::WriteAllBytes($cer, $cert.RawData)
+  $inner = '$ErrorActionPreference = ''Stop''; try { $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,''' + (Q $cer) + '''); if ($c.Thumbprint -ne ''' + $expectedThumb + ''') { exit 1 }; $s = New-Object Security.Cryptography.X509Certificates.X509Store ''TrustedPeople'', ''LocalMachine''; $s.Open(''ReadWrite''); try { $s.Add($c) } finally { $s.Close() } } catch { exit 1 }'
+  $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+  # Full path: a relative name is looked up in the current directory first.
+  $root = $env:SystemRoot; if (-not $root) { $root = 'C:\Windows' }
+  $psexe = [IO.Path]::Combine($root, 'System32\WindowsPowerShell\v1.0\powershell.exe')
+  try {
+    $p = Start-Process -FilePath $psexe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
+    if ($p.ExitCode -ne 0) { $result = 'failed'; $msg = 'the elevated import exited with code ' + $p.ExitCode }
+  } catch {
+    if (Declined $_.Exception) { $result = 'declined' } else { $result = 'failed'; $msg = ($_.Exception.Message -replace '\s+', ' ') }
+  }
 } catch {
-  if (Declined $_.Exception) { 'MSIXRUN_RESULT=declined'; exit 3 }
-  'MSIXRUN_RESULT=failed'
-  'MSIXRUN_MESSAGE=' + ($_.Exception.Message -replace '\s+', ' ')
-  exit 4
+  $result = 'failed'; $msg = ($_.Exception.Message -replace '\s+', ' ')
+} finally {
+  Remove-Item -LiteralPath $cer -Force -ErrorAction SilentlyContinue
 }
-if ($p.ExitCode -ne 0) { 'MSIXRUN_RESULT=failed'; 'MSIXRUN_MESSAGE=the elevated import exited with code ' + $p.ExitCode; exit 4 }
-if (-not (Test-Path ('Cert:\LocalMachine\TrustedPeople\' + $cert.Thumbprint))) { 'MSIXRUN_RESULT=unverified'; exit 5 }
-'MSIXRUN_RESULT=ok'
+if ($result -eq 'ok' -and -not (Test-Path ('Cert:\LocalMachine\TrustedPeople\' + $cert.Thumbprint))) { $result = 'unverified' }
+'MSIXRUN_RESULT=' + $result
+if ($msg) { 'MSIXRUN_MESSAGE=' + $msg }
+exit @{ ok = 0; declined = 3; failed = 4; unverified = 5 }[$result]
 PS
 }
 
@@ -331,21 +343,60 @@ echo "Package: $pkgname"
 allow_unsigned=0
 msg=""
 in_out() { printf '%s\n' "$out" | grep -qiE "$1"; }
+fcode="" ecode=""
 
-# Windows' own wording for each failure; codes come from the exception text.
-UNTRUSTED='0x800B0109|0x800B010A|0x800B0112|0x800B0004|root certificate of the signature|chain.*cannot be built'
-UNSIGNED='0x800B0100|must be digitally signed|not signed'
-# Only this means another publisher's copy is in the way. Any other failure
-# (disk full, bad dependency, corrupt package) must never lead to a removal.
-# 0x80073CF3 is Windows' generic "failed dependency or conflict validation"
-# code (a missing framework returns it too), so it counts only when the message
-# also says the package conflicts. A bare 0x80073CF3 never leads to a removal.
-CONFLICT='0x80073CFB'
-GENERIC_FAILURE='0x80073CF3'
+# Failures are classified on the deployment HRESULT that Windows prints in its
+# message ("Deployment failed with HRESULT: 0x..."), after the package path and
+# file name are removed from the text (a file named 0x80073CFB.msix must not
+# look like an error code). Only when the message holds no HRESULT at all does
+# the wording decide. The exception's own HResult (MSIXRUN_HRESULT) is not the
+# deployment HRESULT, so it is used only when the message has no code.
+UNTRUSTED_CODES=" 0X800B0109 0X800B010A 0X800B0112 0X800B0004 "
+UNTRUSTED_WORDING='root certificate of the signature|chain.*cannot be built'
+UNSIGNED_CODES=" 0X800B0100 "
+UNSIGNED_WORDING='must be digitally signed|not signed'
+# Only 0x80073CFB means another publisher's copy is in the way. Any other
+# failure (disk full, bad dependency, corrupt package) must never lead to a
+# removal. 0x80073CF3 is Windows' generic "failed dependency or conflict
+# validation" code (a missing framework returns it too), so it counts only when
+# the message also says the package conflicts. A bare 0x80073CF3 never leads to
+# a removal.
+CONFLICT_CODE="0X80073CFB"
+GENERIC_FAILURE_CODE="0X80073CF3"
 CONFLICT_WORDING='conflicts with|different publisher|another publisher'
+
+# Remove every spelling of the package's path and file name from stdin.
+strip_pkg() {
+  P1="$winpath" P2="${winpath//\\//}" P3="${winpath##*\\}" awk '
+    function strip(s, p,   i, l) {
+      l = length(p); if (l == 0) return s
+      while ((i = index(tolower(s), tolower(p))) > 0) s = substr(s, 1, i - 1) "<package>" substr(s, i + l)
+      return s
+    }
+    { $0 = strip($0, ENVIRON["P1"]); $0 = strip($0, ENVIRON["P2"]); $0 = strip($0, ENVIRON["P3"]); print }'
+}
+
+# The deployment HRESULT in a text, upper case: the one after "HRESULT:" if
+# any, else the first 0x........ token, else nothing.
+failure_code() {
+  local t="$1" c
+  c="$(printf '%s\n' "$t" | grep -oiE 'HRESULT:? *0x[0-9A-Fa-f]{8}' | head -n 1 | grep -oiE '0x[0-9A-Fa-f]{8}')" || c=""
+  [ -n "$c" ] || c="$(printf '%s\n' "$t" | grep -oE '0x[0-9A-Fa-f]{8}' | head -n 1)" || c=""
+  printf '%s' "$c" | tr '[:lower:]' '[:upper:]'
+}
+
+# failure_is <codes> <wording>: does $fcode (or, with no code, $msg) match?
+failure_is() {
+  if [ -n "$fcode" ]; then case "$1" in *" $fcode "*) return 0 ;; *) return 1 ;; esac; fi
+  if [ -n "$ecode" ]; then case "$1" in *" $ecode "*) return 0 ;; esac; fi
+  printf '%s\n' "$msg" | grep -qiE "$2"
+}
 is_conflict() {
-  in_out "$CONFLICT" && return 0
-  in_out "$GENERIC_FAILURE" && in_out "$CONFLICT_WORDING"
+  local c="$fcode"
+  # No code in the message: the exception's HResult counts only if it is itself a conflict code.
+  [ -n "$c" ] || case "$ecode" in "$CONFLICT_CODE"|"$GENERIC_FAILURE_CODE") c="$ecode" ;; esac
+  [ "$c" = "$CONFLICT_CODE" ] && return 0
+  [ "$c" = "$GENERIC_FAILURE_CODE" ] && printf '%s\n' "$msg" | grep -qiE "$CONFLICT_WORDING"
 }
 
 trust_done=0 unsigned_done=0 conflict_done=0
@@ -353,10 +404,13 @@ while :; do
   echo "Installing $winpath ..."
   run_ps ps_install "\$allowUnsigned = [bool]$allow_unsigned"
   if [ "$rc" -eq 0 ] && in_out '^MSIXRUN_OK'; then break; fi
-  msg="$(field MSIXRUN_MESSAGE)"; [ -n "$msg" ] || msg="$out"
+  msg="$(field MSIXRUN_MESSAGE)"; [ -n "$msg" ] || msg="$(printf '%s\n' "$out" | grep -v '^MSIXRUN_HRESULT=')"
+  msg="$(printf '%s\n' "$msg" | strip_pkg)"
+  fcode="$(failure_code "$msg")"
+  ecode="$(failure_code "$(field MSIXRUN_HRESULT)")"
 
   # 3a. The publisher is not trusted.
-  if in_out "$UNTRUSTED" && [ "$trust_done" -eq 0 ]; then
+  if [ "$trust_done" -eq 0 ] && failure_is "$UNTRUSTED_CODES" "$UNTRUSTED_WORDING"; then
     run_ps ps_signer
     status="$(field STATUS)"
     subject="$(field SUBJECT)"; thumb="$(field THUMBPRINT)"; notafter="$(field NOTAFTER)"
@@ -368,6 +422,11 @@ while :; do
       UnknownError|NotTrusted) ;;
       *) die "the package's signature is not valid (status: ${status:-unknown}), so msixrun will not offer to trust it. Get a fresh copy of the package. $msg" ;;
     esac
+    # The thumbprint that is shown and later checked must be plain SHA-1 hex.
+    case "$thumb" in
+      *[!0-9A-F]*) die "the signer's thumbprint is not plain hex, so msixrun will not offer to trust it" ;;
+    esac
+    [ "${#thumb}" -eq 40 ] || die "the signer's thumbprint is not 40 hex characters, so msixrun will not offer to trust it"
     {
       echo
       echo "Signer:      $subject"
@@ -376,11 +435,13 @@ while :; do
     } >&2
     if confirm "Windows does not trust the publisher of this package. Trust $subject and install? [y/N]" trust; then
       echo "Windows will ask for permission once (UAC)." >&2
-      run_ps ps_trust
+      # The trust step reads the signer again and acts only on this thumbprint.
+      run_ps ps_trust "\$expectedThumb = '$thumb'"
       case "$(field MSIXRUN_RESULT)" in
         ok) echo "Trusted $subject on this PC (Local Machine, Trusted People)." >&2 ;;
         declined) die "permission was declined, so $subject was not trusted. Nothing was changed." ;;
         nocert) die "the package has no signer certificate to trust" ;;
+        changed) die "the package's signer is no longer the one you were shown, so nothing was trusted. Get a fresh copy of the package." ;;
         unverified) die "the certificate import ran but the thumbprint is not in Trusted People. Nothing was installed." ;;
         *) die "could not trust the certificate: $(field MSIXRUN_MESSAGE)" ;;
       esac
@@ -395,7 +456,7 @@ while :; do
   fi
 
   # 3b. The package is not signed at all.
-  if in_out "$UNSIGNED" && [ "$unsigned_done" -eq 0 ]; then
+  if [ "$unsigned_done" -eq 0 ] && failure_is "$UNSIGNED_CODES" "$UNSIGNED_WORDING"; then
     run_ps ps_devmode
     devmode="$(field DEVMODE)"; canunsigned="$(field ALLOWUNSIGNED)"
     if [ "$devmode" = 1 ] && [ "$canunsigned" = 1 ]; then

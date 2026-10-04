@@ -62,7 +62,11 @@ case "$step" in
     line="$(sed -n "${n}p" "$T/install.seq")"; [ -n "$line" ] || line="$(tail -n 1 "$T/install.seq")"
     if [ "$line" = ok ]; then echo MSIXRUN_OK; exit 0; fi
     echo "MSIXRUN_HRESULT=0x80131500"
-    echo "MSIXRUN_MESSAGE=Deployment failed with HRESULT: $line, stub failure"
+    # A line starting with RAW: is the whole message, as Windows might word it.
+    case "$line" in
+      RAW:*) echo "MSIXRUN_MESSAGE=${line#RAW:}" ;;
+      *) echo "MSIXRUN_MESSAGE=Deployment failed with HRESULT: $line, stub failure" ;;
+    esac
     exit 1 ;;
   signer)   cat "$T/signer.out" ;;
   trust)    cat "$T/trust.out"; exit "$(cat "$T/trust.rc")" ;;
@@ -236,15 +240,17 @@ assert_out "Valid until: 2030-01-02"
 assert_steps "manifest install signer trust install launch"
 assert_file_has "$T/script.trust.1" "LocalMachine\\TrustedPeople"
 assert_file_has "$T/script.trust.1" "-EncodedCommand"
-assert_file_has "$T/script.trust.1" 'ToBase64String($cert.RawData)'
+assert_file_has "$T/script.trust.1" 'WriteAllBytes($cer, $cert.RawData)'
 assert_file_has "$T/script.trust.1" '$c.Thumbprint -ne'
+assert_file_has "$T/script.trust.1" "\$expectedThumb = 'AABBCCDDEEFF00112233445566778899AABBCCDD'"
 assert_file_has "$T/script.trust.1" "-Verb RunAs -Wait -PassThru"
 assert_file_has "$T/script.trust.1" "\$pkg = 'C:\\fake\\app.msix'"
-new_test "trust script writes no certificate file and imports no file by path"
+new_test "trust step sends the elevated child a .cer path and thumbprint, never the certificate bytes"
 printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; answers y; run_msixrun app.msix
-for banned in Export-Certificate Import-Certificate .cer GetTempPath; do
+for banned in 'ToBase64String($cert.RawData)' 'FromBase64String' Import-Certificate; do
   if grep -qF -- "$banned" "$T/script.trust.1"; then bad "trust script mentions $banned"; else ok; fi
 done
+assert_file_has "$T/script.trust.1" "'.cer'"
 new_test "trust script never touches the Root store"
 printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; answers y; run_msixrun app.msix
 if grep -qiE 'Cert:.LocalMachine.Root|-CertStoreLocation[^|]*Root|\\Root\b' "$T/script.trust.1"; then bad "script mentions the Root store"; else ok; fi
@@ -307,7 +313,7 @@ for st in HashMismatch NotSigned Incompatible NotSupportedFileFormat; do
 done
 new_test "signature status NotTrusted is offered for trust"
 printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
-printf 'STATUS=NotTrusted\nSUBJECT=CN=Acme Ltd, O=Acme\nTHUMBPRINT=AABB\nNOTAFTER=2030-01-02\n' >"$T/signer.out"
+printf 'STATUS=NotTrusted\nSUBJECT=CN=Acme Ltd, O=Acme\nTHUMBPRINT=AABBCCDDEEFF00112233445566778899AABBCCDD\nNOTAFTER=2030-01-02\n' >"$T/signer.out"
 run_msixrun app.msix --trust --no-launch
 assert_rc 0; assert_step trust
 new_test "package with no signer certificate"
@@ -319,6 +325,26 @@ new_test "trust succeeds but the retry fails again: no loop"
 printf '%s\n%s\n%s\n' "$UNTRUSTED" "$UNTRUSTED" "$UNTRUSTED" >"$T/install.seq"; no_tty
 run_msixrun app.msix --trust
 assert_rc 1; assert_count install 2; assert_count trust 1; assert_out "install failed"
+
+new_test "trust refuses a thumbprint that is not 40 uppercase hex"
+printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
+printf 'STATUS=UnknownError\nSUBJECT=CN=Acme Ltd, O=Acme\nTHUMBPRINT=AABB\nNOTAFTER=2030-01-02\n' >"$T/signer.out"
+run_msixrun app.msix --yes
+assert_rc 1; assert_out "not 40 hex"; assert_no_step trust; assert_count install 1
+new_test "trust refuses a thumbprint with lower-case or odd characters"
+printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
+printf 'STATUS=UnknownError\nSUBJECT=CN=Acme Ltd, O=Acme\nTHUMBPRINT=aabbccddeeff00112233445566778899aabbccdd\nNOTAFTER=2030-01-02\n' >"$T/signer.out"
+run_msixrun app.msix --yes
+assert_rc 1; assert_out "not plain hex"; assert_no_step trust
+new_test "trust step passes the thumbprint the user was shown, and only that one"
+printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; answers y; run_msixrun app.msix --no-launch
+assert_rc 0; assert_out "Thumbprint:  AABBCCDDEEFF00112233445566778899AABBCCDD (SHA-1)"
+assert_file_has "$T/script.trust.1" "\$expectedThumb = 'AABBCCDDEEFF00112233445566778899AABBCCDD'"
+new_test "trust step reports a signer that changed after consent, and the install is not retried"
+printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
+printf 'MSIXRUN_RESULT=changed\n' >"$T/trust.out"; echo 6 >"$T/trust.rc"
+run_msixrun app.msix --trust
+assert_rc 1; assert_out "no longer the one you were shown"; assert_out "nothing was trusted"; assert_count install 1
 
 # ---------------------------------------------------------------- unsigned
 
@@ -391,6 +417,30 @@ new_test "trust succeeds, retry fails for another reason, older copy exists: not
 printf '%s\n0x80070070\n' "$UNTRUSTED" >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
 run_msixrun app.msix --yes --no-launch
 assert_rc 1; assert_step trust; assert_no_step remove; assert_out "install failed"
+new_test "package named 0x80073CFB.msix failing for another reason never reaches removal (path in message)"
+cp "$T/app.msix" "$T/0x80073CFB.msix"
+printf 'RAW:Windows cannot open C:\\fake\\0x80073CFB.msix because the disk is full\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
+run_msixrun 0x80073CFB.msix --yes --no-launch
+assert_rc 1; assert_out "install failed"; assert_no_step conflict; assert_no_step remove; assert_not_out "Remove it"; assert_count install 1
+new_test "package named 0x80073CFB.msix: the real HRESULT in the message still decides"
+cp "$T/app.msix" "$T/0x80073CFB.msix"
+printf 'RAW:Deployment failed with HRESULT: 0x80070070, no room for C:\\fake\\0x80073CFB.msix\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
+run_msixrun 0x80073CFB.msix --yes --no-launch
+assert_rc 1; assert_no_step remove
+new_test "package named 0x80073CFB.msix with a genuine conflict is still removed on --yes"
+cp "$T/app.msix" "$T/0x80073CFB.msix"
+printf 'RAW:Deployment failed with HRESULT: 0x80073CFB, conflict for C:\\fake\\0x80073CFB.msix\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
+run_msixrun 0x80073CFB.msix --yes --no-launch
+assert_rc 0; assert_step remove
+new_test "package named like an untrusted code does not trigger the trust prompt"
+cp "$T/app.msix" "$T/0x800B0109.msix"
+printf 'RAW:cannot read C:\\fake\\0x800B0109.msix\nok\n' >"$T/install.seq"; no_tty
+run_msixrun 0x800B0109.msix --trust --no-launch
+assert_rc 1; assert_no_step signer; assert_no_step trust
+new_test "a code in the message wins over wording from another failure"
+printf 'RAW:Deployment failed with HRESULT: 0x80070070, the package must be digitally signed but the disk is full\nok\n' >"$T/install.seq"; no_tty
+run_msixrun app.msix --yes
+assert_rc 1; assert_no_step devmode
 new_test "older copy, user says n"
 printf '0x80073CFB\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers n
 run_msixrun app.msix

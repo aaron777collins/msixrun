@@ -114,6 +114,10 @@ Describe 'msixrun.ps1' {
         }
         Mock Start-Process {
             $script:ElevatedArgs = $ArgumentList
+            $m = [regex]::Match((Get-ElevatedCommand), "\(,'([^']+)'\)")
+            $script:CerPath = $m.Groups[1].Value
+            $script:CerExistedAtStart = [IO.File]::Exists($script:CerPath)
+            $script:CerBytesAtStart = if ($script:CerExistedAtStart) { [IO.File]::ReadAllBytes($script:CerPath) } else { $null }
             if ($script:ElevatedThrow) { throw $script:ElevatedThrow }
             [pscustomobject]@{ ExitCode = $script:ElevatedExit }
         } -ParameterFilter { $FilePath -match $script:PsExeRx }
@@ -229,7 +233,7 @@ Describe 'msixrun.ps1' {
     Context 'untrusted publisher' {
         BeforeEach { $script:Untrusted = 'Deployment failed with HRESULT: 0x800B0109, The root certificate of the signature in the app package or bundle must be trusted.' }
 
-        It 'asks, sends the bytes of THIS signer to one elevated child, imports to TrustedPeople, verifies, retries once' {
+        It 'asks, sends the .cer path and thumbprint of THIS signer to one elevated child, imports to TrustedPeople, verifies, retries once' {
             $script:InstallResults = @($script:Untrusted, $null)
             $script:Answers.Enqueue('y')
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $false -Trust $false -Yes $false) | Should -Be 0
@@ -243,10 +247,16 @@ Describe 'msixrun.ps1' {
             $inner | Should -Match 'X509Store'
             $inner | Should -Match "'TrustedPeople', 'LocalMachine'"
             $inner | Should -Not -Match "'Root'"   # not the base64 text, which is random
-            $inner | Should -Not -Match 'Import-Certificate|Export-Certificate|\.cer'
-            $inner | Should -Match ([regex]::Escape([Convert]::ToBase64String($script:TestCert.RawData)))
+            $inner | Should -Not -Match 'Import-Certificate|Export-Certificate'
+            # No certificate bytes on the command line: only the .cer path and the thumbprint.
+            $inner | Should -Not -Match ([regex]::Escape([Convert]::ToBase64String($script:TestCert.RawData).Substring(0, 40)))
+            $inner | Should -Not -Match 'FromBase64String'
             $inner | Should -Match ([regex]::Escape($script:TestCert.Thumbprint))
-            Should -Invoke Test-Path -Times 0 -Exactly -ParameterFilter { $LiteralPath -like '*.cer' }
+            $script:CerPath | Should -Match '\.cer$'
+            $script:CerExistedAtStart | Should -BeTrue
+            [Convert]::ToBase64String($script:CerBytesAtStart) | Should -Be ([Convert]::ToBase64String($script:TestCert.RawData))
+            [IO.File]::Exists($script:CerPath) | Should -BeFalse   # removed afterwards
+            $script:ElevatedArgs[4].Length | Should -BeLessThan 2048
             $script:InstallCalls | Should -Be 2
             Should -Invoke Test-Path -Times 1 -Exactly -ParameterFilter { $LiteralPath -eq ('Cert:\LocalMachine\TrustedPeople\' + $script:TestCert.Thumbprint) }
         }
@@ -350,17 +360,42 @@ Describe 'msixrun.ps1' {
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $false) | Should -Be 0
             Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -match $script:PsExeRx }
         }
-        It 'the elevated verify step accepts the right thumbprint and refuses a different one' {
+        It 'the elevated verify step accepts the right thumbprint and refuses a different one, or a swapped file' {
             $pwsh = (Get-Process -Id $PID).Path
+            $cer = Join-Path $script:Work 'verify.cer'
+            [IO.File]::WriteAllBytes($cer, $script:TestCert.RawData)
             $run = {
-                param($thumb)
-                $cmd = (Get-CertVerifyScript -RawData $script:TestCert.RawData -Thumbprint $thumb) + '} catch { exit 1 }'
+                param($thumb, $file)
+                $cmd = (Get-CertVerifyScript -CerPath $file -Thumbprint $thumb) + '} catch { exit 1 }'
                 $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
                 $null = & $pwsh -NoProfile -EncodedCommand $enc
                 $LASTEXITCODE
             }
-            (& $run $script:TestCert.Thumbprint) | Should -Be 0
-            (& $run ('0' * 40)) | Should -Be 1
+            (& $run $script:TestCert.Thumbprint $cer) | Should -Be 0
+            (& $run ('0' * 40) $cer) | Should -Be 1
+            # a different certificate in the file than the one the user was shown
+            $other = (New-Object Security.Cryptography.X509Certificates.CertificateRequest 'CN=Other', ([Security.Cryptography.RSA]::Create(2048)),
+                ([Security.Cryptography.HashAlgorithmName]::SHA256), ([Security.Cryptography.RSASignaturePadding]::Pkcs1)).CreateSelfSigned([DateTimeOffset]'2029-01-01T12:00:00Z', [DateTimeOffset]'2030-01-02T12:00:00Z')
+            $swapped = Join-Path $script:Work 'swapped.cer'
+            [IO.File]::WriteAllBytes($swapped, $other.RawData)
+            (& $run $script:TestCert.Thumbprint $swapped) | Should -Be 1
+            (& $run $script:TestCert.Thumbprint (Join-Path $script:Work 'missing.cer')) | Should -Be 1
+        }
+        It 'Get-CertVerifyScript refuses a thumbprint that is not 40 uppercase hex' -ForEach @(
+            @{ t = 'abcd' }, @{ t = ('a' * 40) }, @{ t = ("A" * 39 + "'") }, @{ t = '' }) {
+            { Get-CertVerifyScript -CerPath 'C:\x.cer' -Thumbprint $t } | Should -Throw
+        }
+        It 'the encoded elevated command stays well under 2 KB and holds only a path and a thumbprint' {
+            $script:InstallResults = @($script:Untrusted, $null)
+            (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $false) | Should -Be 0
+            $script:ElevatedArgs[4].Length | Should -BeLessThan 2048
+            (Get-ElevatedCommand).Length | Should -BeLessThan 900
+        }
+        It 'the user is shown the thumbprint that the elevated command carries' {
+            $script:InstallResults = @($script:Untrusted, $null)
+            (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $false) | Should -Be 0
+            Get-LogText | Should -Match ('Thumbprint:\s+' + $script:TestCert.Thumbprint)
+            Get-ElevatedCommand | Should -Match ("'" + $script:TestCert.Thumbprint + "'")
         }
         It 'fails when the package has no signer certificate' {
             $script:InstallResults = @($script:Untrusted, $null)
@@ -478,6 +513,42 @@ Describe 'msixrun.ps1' {
             $script:InstallResults = @('0x800B0109', 'Deployment failed with HRESULT: 0x80070070, disk full')
             (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $true) | Should -Be 1
             $script:Removed.Count | Should -Be 0
+        }
+        It 'a package named 0x80073CFB.msix failing for another reason never reaches removal, even with -Yes' {
+            $dir = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+            $named = New-TestMsix -Dir $dir -FileName '0x80073CFB.msix'
+            $script:InstallResults = @("Windows cannot open $named because the disk is full", $null)
+            (Invoke-Msixrun -Source $named -NoLaunch $true -Trust $true -Yes $true) | Should -Be 1
+            $script:Prompts.Count | Should -Be 0
+            $script:Removed.Count | Should -Be 0
+            $script:InstallCalls | Should -Be 1
+            Get-LogText | Should -Match 'install failed'
+        }
+        It 'a package named 0x80073CFB.msix with a real HRESULT for another failure never reaches removal' {
+            $dir = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+            $named = New-TestMsix -Dir $dir -FileName '0x80073CFB.msix'
+            $script:InstallResults = @("Deployment failed with HRESULT: 0x80070070, no room for $named", $null)
+            (Invoke-Msixrun -Source $named -NoLaunch $true -Trust $true -Yes $true) | Should -Be 1
+            $script:Removed.Count | Should -Be 0
+        }
+        It 'a package named 0x80073CFB.msix with a genuine conflict is still removed on -Yes' {
+            $dir = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+            $named = New-TestMsix -Dir $dir -FileName '0x80073CFB.msix'
+            $script:InstallResults = @("Deployment failed with HRESULT: 0x80073CFB, conflict for $named", $null)
+            (Invoke-Msixrun -Source $named -NoLaunch $true -Trust $true -Yes $true) | Should -Be 0
+            $script:Removed.Count | Should -Be 1
+        }
+        It 'a package named like an untrusted code does not trigger the trust prompt' {
+            $dir = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+            $named = New-TestMsix -Dir $dir -FileName '0x800B0109.msix'
+            $script:InstallResults = @("cannot read $named", $null)
+            (Invoke-Msixrun -Source $named -NoLaunch $true -Trust $true -Yes $true) | Should -Be 1
+            Should -Invoke Start-Process -Times 0 -Exactly
+        }
+        It 'a code in the message wins over wording from another failure' {
+            $script:InstallResults = @('Deployment failed with HRESULT: 0x80070070, the package must be digitally signed but the disk is full', $null)
+            (Invoke-Msixrun -Source $script:Pkg -NoLaunch $true -Trust $true -Yes $true) | Should -Be 1
+            Should -Invoke Test-DeveloperMode -Times 0 -Exactly
         }
         It 'keeps the old one when the answer is n' {
             $script:InstallResults = @($script:Conflict, $null)
@@ -630,10 +701,29 @@ Describe 'msixrun.ps1 helpers' {
             Get-SystemExePath 'explorer.exe' | Should -Match '^D:.Win.explorer\.exe$'
         } finally { $env:SystemRoot = $old }
     }
-    It 'Get-FailureText includes the HRESULT in hex' {
+    It 'Get-FailureText appends the exception HResult in hex, after the message, as a last resort' {
         $ex = New-Object System.Runtime.InteropServices.COMException 'boom', (HResultOf '800B0109')
         $text = try { throw $ex } catch { Get-FailureText $_ }
         $text | Should -Match '0x800B0109'
+        Get-FailureCode $text | Should -BeNullOrEmpty        # the message holds no code
+        Get-ExceptionCode $text | Should -Contain '0X800B0109'
+    }
+    It 'Get-FailureText removes the package path and file name from the message' {
+        $p = 'C:\Users\me\Downloads\0x80073CFB.msix'
+        $text = try { throw ('Deployment failed for ' + $p + ' (0X80073CFB.MSIX)') } catch { Get-FailureText $_ -Path $p }
+        $text | Should -Not -Match '80073CFB'
+        $text | Should -Match '<package>'
+    }
+    It 'Get-FailureCode prefers the code after HRESULT: and ignores the exception HResult' {
+        Get-FailureCode 'foo 0x80070070 bar HRESULT: 0x80073cfb, x [exception HResult: 0x800B0109]' | Should -Be '0X80073CFB'
+        Get-FailureCode 'no code here [exception HResult: 0x800B0109]' | Should -BeNullOrEmpty
+    }
+    It 'Test-FailureKind: a code decides; wording only without a code' {
+        $c = $script:UntrustedCodes; $w = $script:UntrustedWording
+        Test-FailureKind 'HRESULT: 0x800B0109 x' $c $w | Should -BeTrue
+        Test-FailureKind 'HRESULT: 0x80070070 root certificate of the signature' $c $w | Should -BeFalse
+        Test-FailureKind 'root certificate of the signature must be trusted [exception HResult: 0x80131500]' $c $w | Should -BeTrue
+        Test-FailureKind 'plain [exception HResult: 0x800B0109]' $c $w | Should -BeTrue
     }
 }
 
@@ -662,20 +752,6 @@ Describe 'msixrun (bash) PowerShell snippets' {
         [void][System.Management.Automation.Language.Parser]::ParseInput((Get-SnippetBody $name), [ref]$null, [ref]$errs)
         $errs | Should -BeNullOrEmpty
     }
-    It 'the elevated command built by ps_trust parses' {
-        $body = Get-SnippetBody 'ps_trust'
-        $line = ($body -split "`n" | Where-Object { $_ -like '$inner = *' } | Select-Object -First 1)
-        $line | Should -Not -BeNullOrEmpty
-        $b64 = [Convert]::ToBase64String($script:TestCert.RawData)
-        $b = ''
-        $cert = [pscustomobject]@{ Thumbprint = $script:TestCert.Thumbprint }
-        function Q($s) { [regex]::Replace($s, '([\x27\u2018\u2019\u201A\u201B])', '$1$1') }
-        . ([scriptblock]::Create($line))
-        $errs = $null
-        [void][System.Management.Automation.Language.Parser]::ParseInput($inner, [ref]$null, [ref]$errs)
-        $errs | Should -BeNullOrEmpty
-        $inner | Should -Match ([regex]::Escape($b64))
-    }
     Context 'executed with the Windows commands replaced' {
         BeforeAll {
             $script:Pwsh = (Get-Process -Id $PID).Path
@@ -685,7 +761,7 @@ Describe 'msixrun (bash) PowerShell snippets' {
             # (functions win over cmdlets). Returns the output lines and exit code.
             function Invoke-Snippet {
                 param([string]$Name, [string]$Prelude = '', [string]$Pkg = 'C:\fake\app.msix')
-                Remove-Item -LiteralPath $script:Log2 -ErrorAction SilentlyContinue
+                foreach ($x in '', '.args', '.cer', '.cerpath') { Remove-Item -LiteralPath ($script:Log2 + $x) -ErrorAction SilentlyContinue }
                 $text = @(
                     "`$global:CallLog = '" + $script:Log2.Replace("'", "''") + "'"
                     "`$global:Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String('$($script:CertB64)'))"
@@ -700,7 +776,8 @@ Describe 'msixrun (bash) PowerShell snippets' {
                 [pscustomobject]@{ Lines = @($o | ForEach-Object { "$_" }); Code = $LASTEXITCODE }
             }
             $script:SignerMock = 'function Get-AuthenticodeSignature { param($FilePath) [pscustomobject]@{ Status = ''UnknownError''; SignerCertificate = $global:Cert } }'
-            $script:StartMock = 'function Start-Process { param($FilePath, $Verb, [switch]$Wait, [switch]$PassThru, $ArgumentList) Set-Content -LiteralPath $global:CallLog -Value $FilePath; %BODY% }'
+            $script:StartMock = 'function Start-Process { param($FilePath, $Verb, [switch]$Wait, [switch]$PassThru, $ArgumentList) Set-Content -LiteralPath $global:CallLog -Value $FilePath; Set-Content -LiteralPath ($global:CallLog + ''.args'') -Value $ArgumentList[4]; $d = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[4])); $cp = [regex]::Match($d, ''\(,.([^\x27]+).\)'').Groups[1].Value; Set-Content -LiteralPath ($global:CallLog + ''.cer'') -Value ([IO.File]::Exists($cp)).ToString(); Set-Content -LiteralPath ($global:CallLog + ''.cerpath'') -Value $cp; %BODY% }'
+            $script:ThumbLine = "`n`$expectedThumb = '" + $script:TestCert.Thumbprint + "'`n"
             $script:TestPathMock = 'function Test-Path { param($Path) %BODY% }'
         }
         It 'ps_install: success prints MSIXRUN_OK and passes -AllowUnsigned only when asked' {
@@ -732,40 +809,77 @@ Describe 'msixrun (bash) PowerShell snippets' {
             $subject.Length | Should -Be (8 + 203)
         }
         It 'ps_trust: success starts the absolute powershell.exe elevated and verifies the store' {
-            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $mock = $script:ThumbLine + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
             $r = Invoke-Snippet -Name ps_trust -Prelude $mock
             $r.Code | Should -Be 0
             $r.Lines | Should -Contain 'MSIXRUN_RESULT=ok'
             (Get-Content -LiteralPath $script:Log2) | Should -Match $script:PsExeRx
         }
+        It 'ps_trust: the elevated command carries only a .cer path and the thumbprint, stays under 2 KB, and the file is removed afterwards' {
+            $mock = $script:ThumbLine + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 0
+            $enc = (Get-Content -LiteralPath ($script:Log2 + '.args') -Raw).Trim()
+            $enc.Length | Should -BeLessThan 2048
+            $cmd = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($enc))
+            $cmd | Should -Not -Match 'FromBase64String'
+            $cmd | Should -Not -Match ([regex]::Escape($script:CertB64.Substring(0, 40)))
+            $cmd | Should -Match ([regex]::Escape($script:TestCert.Thumbprint))
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($cmd, [ref]$null, [ref]$errs)
+            $errs | Should -BeNullOrEmpty
+            (Get-Content -LiteralPath ($script:Log2 + '.cer')).Trim() | Should -Be 'True'
+            [IO.File]::Exists((Get-Content -LiteralPath ($script:Log2 + '.cerpath')).Trim()) | Should -BeFalse
+        }
+        It 'ps_trust: refuses when the second read of the signer has a different thumbprint' {
+            $mock = "`n`$expectedThumb = '" + ('A' * 40) + "'`n" + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 6
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=changed'
+            Test-Path -LiteralPath $script:Log2 | Should -BeFalse   # no elevation
+        }
+        It 'ps_trust: refuses when the signature status is no longer untrusted-but-valid' -ForEach @(@{ st = 'HashMismatch' }, @{ st = 'NotSigned' }, @{ st = 'Valid' }) {
+            $signer = 'function Get-AuthenticodeSignature { param($FilePath) [pscustomobject]@{ Status = ''' + $st + '''; SignerCertificate = $global:Cert } }'
+            $mock = $script:ThumbLine + $signer + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 6
+            $r.Lines | Should -Contain 'MSIXRUN_RESULT=changed'
+            Test-Path -LiteralPath $script:Log2 | Should -BeFalse
+        }
+        It 'ps_trust: refuses an expected thumbprint that is not 40 uppercase hex' -ForEach @(@{ th = 'abcd' }, @{ th = '' }, @{ th = "AA'; calc; '" }) {
+            $mock = "`n`$expectedThumb = '" + $th.Replace("'", "''") + "'`n" + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }')
+            $r = Invoke-Snippet -Name ps_trust -Prelude $mock
+            $r.Code | Should -Be 6
+            Test-Path -LiteralPath $script:Log2 | Should -BeFalse
+        }
         It 'ps_trust: a declined UAC prompt gives declined and exit 3' {
-            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', 'throw (New-Object ComponentModel.Win32Exception 1223)') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $mock = $script:ThumbLine + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', 'throw (New-Object ComponentModel.Win32Exception 1223)') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
             $r = Invoke-Snippet -Name ps_trust -Prelude $mock
             $r.Code | Should -Be 3
             $r.Lines | Should -Contain 'MSIXRUN_RESULT=declined'
         }
         It 'ps_trust: another start failure gives failed, the message, and exit 4' {
-            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', 'throw ''no elevation available''') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $mock = $script:ThumbLine + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', 'throw ''no elevation available''') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
             $r = Invoke-Snippet -Name ps_trust -Prelude $mock
             $r.Code | Should -Be 4
             $r.Lines | Should -Contain 'MSIXRUN_RESULT=failed'
             $r.Lines | Should -Contain 'MSIXRUN_MESSAGE=no elevation available'
         }
         It 'ps_trust: a nonzero exit from the elevated import gives failed and exit 4' {
-            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 1 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
+            $mock = $script:ThumbLine + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 1 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$true')
             $r = Invoke-Snippet -Name ps_trust -Prelude $mock
             $r.Code | Should -Be 4
             $r.Lines | Should -Contain 'MSIXRUN_RESULT=failed'
             $r.Lines | Should -Contain 'MSIXRUN_MESSAGE=the elevated import exited with code 1'
         }
         It 'ps_trust: a certificate missing from the store afterwards gives unverified and exit 5' {
-            $mock = $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$false')
+            $mock = $script:ThumbLine + $script:SignerMock + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }') + "`n" + $script:TestPathMock.Replace('%BODY%', '$false')
             $r = Invoke-Snippet -Name ps_trust -Prelude $mock
             $r.Code | Should -Be 5
             $r.Lines | Should -Contain 'MSIXRUN_RESULT=unverified'
         }
         It 'ps_trust: a package with no signer certificate gives nocert and exit 2, with no elevation' {
-            $mock = 'function Get-AuthenticodeSignature { param($FilePath) [pscustomobject]@{ Status = ''NotSigned''; SignerCertificate = $null } }' + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }')
+            $mock = $script:ThumbLine + 'function Get-AuthenticodeSignature { param($FilePath) [pscustomobject]@{ Status = ''NotSigned''; SignerCertificate = $null } }' + "`n" + $script:StartMock.Replace('%BODY%', '[pscustomobject]@{ ExitCode = 0 }')
             $r = Invoke-Snippet -Name ps_trust -Prelude $mock
             $r.Code | Should -Be 2
             $r.Lines | Should -Contain 'MSIXRUN_RESULT=nocert'

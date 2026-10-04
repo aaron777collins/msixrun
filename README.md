@@ -68,10 +68,14 @@ install fails with an error such as `0x800B0109`. msixrun then:
    `Windows does not trust the publisher of this package. Trust <name> and install? [y/N]`
    Compare the thumbprint with the one the publisher gave you. Control and invisible Unicode
    characters in the name are shown as `?`, and very long names are cut.
-3. On yes, passes that one certificate's bytes inside the elevated command and imports it into the
-   **Local Machine, Trusted People** store. The elevated step first checks the bytes match the
-   thumbprint you were shown. This needs administrator rights, so Windows shows one permission
-   (UAC) prompt. No certificate file is written to disk.
+3. On yes, reads the signer again and goes on only if its thumbprint is exactly the one you were
+   shown and its signature status is still `UnknownError` or `NotTrusted`. Otherwise it stops and
+   changes nothing. It then saves that one certificate to a temporary `.cer` file and starts an
+   elevated step that is given only the file's path and the expected thumbprint, not the
+   certificate itself. The elevated step loads the file, works out the thumbprint again, refuses
+   unless it matches the one you were shown, and only then imports it into the **Local Machine,
+   Trusted People** store. This needs administrator rights, so Windows shows one permission (UAC)
+   prompt. The temporary file is deleted afterwards.
 4. Checks the certificate is now in Trusted People and tries the install again.
 
 What this does and does not do:
@@ -110,15 +114,18 @@ What this does and does not do:
 3. Runs `Add-AppxPackage`. If that fails, it recognizes the failure, fixes that one thing (trust
    the publisher, install unsigned, or remove an older copy from another publisher, each once and
    each with your consent) and retries. A failure it does not recognize is shown and stops.
+   It recognizes a failure by the HRESULT in Windows' message, after removing the package's path
+   and file name from the text (a package called `0x80073CFB.msix` is not an error code). It looks
+   at the wording only when the message has no HRESULT.
 4. Looks up the installed `PackageFamilyName` and the first app `Id`, and launches with
    `explorer.exe "shell:AppsFolder\<PFN>!<AppId>"`.
 
 The Bash version does the same through `powershell.exe`, converting paths with `cygpath -w` or
-`wslpath -w`. No text read from a package is pasted into a command, with one narrow exception: the
-signer's certificate bytes (Base64) and its thumbprint (hex) are embedded in the elevated command,
-which checks the bytes against the thumbprint before importing. Apart from those, the only value
-placed in a PowerShell script is the package path, quoted. The elevated step is passed to
-PowerShell as a Base64 `-EncodedCommand`, started by its full path under `%SystemRoot%` so a file
+`wslpath -w`. No text read from a package is pasted into a command, with one narrow exception:
+the signer's thumbprint is passed to the elevated command, and only after it has been checked to
+be exactly 40 uppercase hex characters. Apart from that, the only value placed in a PowerShell
+script is the package path, quoted, plus the path of the temporary `.cer` file. The elevated step
+is passed to PowerShell as a Base64 `-EncodedCommand`, started by its full path under `%SystemRoot%` so a file
 named `powershell.exe` in the current folder is never run.
 
 The one-liner is meant for an interactive prompt. If you paste it inside a saved `.ps1` file it
