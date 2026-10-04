@@ -2,16 +2,23 @@
 # msixrun - install and launch an MSIX/APPX package from bash on Windows.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="1.1.0"
 
 usage() {
   cat <<USAGE
 msixrun $VERSION - install and launch an MSIX package from bash on Windows
 
-Usage: msixrun <file.msix|.msixbundle|.appx|.appxbundle> [--no-launch]
+Usage: msixrun <file-or-url.msix|.msixbundle|.appx|.appxbundle> [options]
+
+The package can be a local file or an http(s) URL (it is downloaded first).
 
 Options:
   --no-launch   install only, do not start the app
+  --trust       if Windows does not trust the package's publisher, trust that
+                one publisher certificate (this PC only) without asking
+  -y, --yes     answer yes to every question (trust the publisher, remove an
+                older copy from a different publisher, install unsigned when
+                Developer Mode allows it)
   -h, --help    show this help
   --version     show version
 USAGE
@@ -19,28 +26,268 @@ USAGE
 
 die() { echo "msixrun: error: $*" >&2; exit 1; }
 
+# Run a PowerShell script text. Scripts below use single quotes only, so the
+# text survives the Windows command line unchanged.
 ps() { powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$1" | tr -d '\r'; }
 
-file="" launch=1
+# Quote a value for use inside a PowerShell single-quoted string. PowerShell
+# also treats the curly single quotes U+2018 to U+201B as quote characters, so
+# those are doubled too.
+psq() {
+  local s="$1" q sq="'"
+  s=${s//"$sq"/$sq$sq}
+  for q in $'\xe2\x80\x98' $'\xe2\x80\x99' $'\xe2\x80\x9a' $'\xe2\x80\x9b'; do
+    s=${s//"$q"/$q$q}
+  done
+  printf '%s' "$s"
+}
+
+# ---- PowerShell snippets. Fixed text; the only value ever spliced in is the
+# ---- package path, through psq. Nothing read from the package is spliced in.
+
+ps_id_fn() {
+  cat <<'PS'
+function Get-MsixId($p) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip = [IO.Compression.ZipFile]::OpenRead($p)
+  try {
+    $e = $zip.Entries | Where-Object { $_.FullName -in 'AppxManifest.xml','AppxMetadata/AppxBundleManifest.xml' } | Select-Object -First 1
+    if (-not $e) { throw 'no AppxManifest.xml or AppxBundleManifest.xml found in package' }
+    $r = New-Object IO.StreamReader($e.Open())
+    try { [xml]$x = $r.ReadToEnd() } finally { $r.Dispose() }
+    if ($x.Package) { $x.Package.Identity } else { $x.Bundle.Identity }
+  } finally { $zip.Dispose() }
+}
+PS
+}
+
+ps_manifest() {
+  ps_id_fn
+  cat <<'PS'
+# step: manifest
+$ErrorActionPreference = 'Stop'
+$i = Get-MsixId $pkg
+'NAME=' + $i.Name
+'PUBLISHER=' + $i.Publisher
+PS
+}
+
+ps_install() {
+  cat <<'PS'
+# step: install
+$ErrorActionPreference = 'Stop'
+try {
+  if ($allowUnsigned) { Add-AppxPackage -Path $pkg -AllowUnsigned } else { Add-AppxPackage -Path $pkg }
+  'MSIXRUN_OK'
+} catch {
+  $h = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$_.Exception.HResult), 0)
+  'MSIXRUN_HRESULT=0x{0:X8}' -f $h
+  'MSIXRUN_MESSAGE=' + (($_.Exception.Message + ' ' + $_.FullyQualifiedErrorId) -replace '\s+', ' ')
+  exit 1
+}
+PS
+}
+
+ps_signer() {
+  cat <<'PS'
+# step: signer
+$ErrorActionPreference = 'Stop'
+function Clean($s) { ([string]$s) -replace '[\p{Cc}]+', ' ' }
+$sig = Get-AuthenticodeSignature -FilePath $pkg
+'STATUS=' + $sig.Status
+$c = $sig.SignerCertificate
+if ($c) {
+  'SUBJECT=' + (Clean $c.Subject)
+  'THUMBPRINT=' + (Clean $c.Thumbprint)
+  'NOTAFTER=' + $c.NotAfter.ToString('yyyy-MM-dd')
+}
+PS
+}
+
+# Export THIS package's signer certificate and import it into
+# LocalMachine\TrustedPeople in one elevated child. The child's command is
+# passed as -EncodedCommand (Base64 of UTF-16LE), so no text is ever parsed
+# as part of a command line.
+ps_trust() {
+  cat <<'PS'
+# step: trust
+$ErrorActionPreference = 'Stop'
+function Q($s) { [regex]::Replace($s, '([''\u2018\u2019\u201A\u201B])', '$1$1') }
+function Declined($e) {
+  while ($e) {
+    if (($e -is [ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 1223) -or $e.Message -match 'cancell?ed by the user') { return $true }
+    $e = $e.InnerException
+  }
+  $false
+}
+$sig = Get-AuthenticodeSignature -FilePath $pkg
+$cert = $sig.SignerCertificate
+if (-not $cert) { 'MSIXRUN_RESULT=nocert'; exit 2 }
+$cer = Join-Path ([IO.Path]::GetTempPath()) ('msixrun-' + [guid]::NewGuid().ToString('N') + '.cer')
+try {
+  Export-Certificate -Cert $cert -FilePath $cer -Type CERT | Out-Null
+  $inner = '$ErrorActionPreference = ''Stop''; try { Import-Certificate -FilePath ''' + (Q $cer) + ''' -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null } catch { exit 1 }'
+  $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+  try {
+    $p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
+  } catch {
+    if (Declined $_.Exception) { 'MSIXRUN_RESULT=declined'; exit 3 }
+    'MSIXRUN_RESULT=failed'
+    'MSIXRUN_MESSAGE=' + ($_.Exception.Message -replace '\s+', ' ')
+    exit 4
+  }
+  if ($p.ExitCode -ne 0) { 'MSIXRUN_RESULT=failed'; 'MSIXRUN_MESSAGE=the elevated import exited with code ' + $p.ExitCode; exit 4 }
+  if (-not (Test-Path ('Cert:\LocalMachine\TrustedPeople\' + $cert.Thumbprint))) { 'MSIXRUN_RESULT=unverified'; exit 5 }
+  'MSIXRUN_RESULT=ok'
+} finally {
+  Remove-Item -LiteralPath $cer -Force -ErrorAction SilentlyContinue
+}
+PS
+}
+
+ps_devmode() {
+  cat <<'PS'
+# step: devmode
+$v = $null
+try { $v = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction Stop).AllowDevelopmentWithoutDevLicense } catch {}
+'DEVMODE=' + $(if ($v -eq 1) { 1 } else { 0 })
+$cmd = Get-Command Add-AppxPackage -ErrorAction SilentlyContinue
+'ALLOWUNSIGNED=' + $(if ($cmd -and $cmd.Parameters.ContainsKey('AllowUnsigned')) { 1 } else { 0 })
+PS
+}
+
+ps_conflict() {
+  ps_id_fn
+  cat <<'PS'
+# step: conflict
+$ErrorActionPreference = 'Stop'
+$i = Get-MsixId $pkg
+$old = @(Get-AppxPackage -Name $i.Name | Where-Object { $_.Name -eq $i.Name -and $_.Publisher -ne $i.Publisher })
+'CONFLICT=' + $old.Count
+PS
+}
+
+ps_remove() {
+  ps_id_fn
+  cat <<'PS'
+# step: remove
+$ErrorActionPreference = 'Stop'
+try {
+  $i = Get-MsixId $pkg
+  $old = @(Get-AppxPackage -Name $i.Name | Where-Object { $_.Name -eq $i.Name -and $_.Publisher -ne $i.Publisher })
+  foreach ($o in $old) { Remove-AppxPackage -Package $o.PackageFullName }
+  'REMOVED=' + $old.Count
+} catch {
+  'MSIXRUN_MESSAGE=' + ($_.Exception.Message -replace '\s+', ' ')
+  exit 1
+}
+PS
+}
+
+ps_launch() {
+  ps_id_fn
+  cat <<'PS'
+# step: launch
+$ErrorActionPreference = 'Stop'
+$i = Get-MsixId $pkg
+$p = Get-AppxPackage -Name $i.Name | Sort-Object { [version]$_.Version } | Select-Object -Last 1
+if (-not $p) { throw 'package not found after install' }
+$id = @((Get-AppxPackageManifest $p).Package.Applications.Application)[0].Id
+if (-not $id) { throw 'package declares no launchable application' }
+$p.PackageFamilyName + '!' + $id
+PS
+}
+
+# Run a snippet against the package. $1 = snippet function, $2 = extra
+# assignment line (optional). Output is captured in $out, status in $rc.
+out="" rc=0
+run_ps() {
+  local script
+  script="\$pkg = '$(psq "$winpath")'"$'\n'"${2:-}"$'\n'"$("$1")"
+  if out="$(ps "$script" 2>&1)"; then rc=0; else rc=$?; fi
+}
+
+# Value of a KEY=value line from $out.
+field() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -n 1; }
+
+# ---- arguments ----
+
+src="" launch=1 trust=0 yes=0
 for arg in "$@"; do
   case "$arg" in
     -h|--help)   usage; exit 0 ;;
     --version)   echo "msixrun $VERSION"; exit 0 ;;
     --no-launch) launch=0 ;;
+    --trust)     trust=1 ;;
+    -y|--yes)    yes=1 ;;
     -*)          die "unknown option: $arg (try --help)" ;;
-    *)           [ -z "$file" ] || die "only one package file allowed"; file="$arg" ;;
+    *)           [ -z "$src" ] || die "only one package allowed"; src="$arg" ;;
   esac
 done
 
-[ -n "$file" ] || { usage >&2; exit 1; }
-[ -f "$file" ] || die "file not found: $file"
-case "$(printf '%s' "$file" | tr 'A-Z' 'a-z')" in
-  *.msix|*.msixbundle|*.appx|*.appxbundle) ;;
-  *) die "expected a .msix, .msixbundle, .appx or .appxbundle file: $file" ;;
-esac
+[ -n "$src" ] || { usage >&2; exit 1; }
 command -v powershell.exe >/dev/null 2>&1 || die "powershell.exe not found (run this on Windows: Git Bash, MSYS2 or WSL)"
 
-# 1. Convert to a Windows path.
+has_pkg_ext() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    *.msix|*.msixbundle|*.appx|*.appxbundle) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---- consent ----
+
+tty_path="${MSIXRUN_TTY:-/dev/tty}"
+tty_open=0
+can_prompt() {
+  [ "$tty_open" -eq 1 ] && return 0
+  if { exec 9<"$tty_path"; } 2>/dev/null; then tty_open=1; return 0; fi
+  return 1
+}
+
+# confirm <prompt> <switch that already answers yes: trust|yes>
+# 0 = yes, 1 = no, 2 = cannot ask (no terminal, no switch)
+confirm() {
+  if [ "$yes" -eq 1 ]; then echo "$1 y (--yes)" >&2; return 0; fi
+  if [ "$2" = trust ] && [ "$trust" -eq 1 ]; then echo "$1 y (--trust)" >&2; return 0; fi
+  can_prompt || return 2
+  local ans=""
+  printf '%s ' "$1" >&2
+  IFS= read -r ans <&9 || ans=""
+  case "$ans" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# ---- 1. get the package ----
+
+tmpdir=""
+cleanup() { [ -z "$tmpdir" ] || rm -rf "$tmpdir"; }
+trap cleanup EXIT
+
+case "$src" in
+  http://*|https://*)
+    command -v curl >/dev/null 2>&1 || die "curl is required to download a package URL"
+    base="${TMPDIR:-/tmp}"
+    if ! command -v cygpath >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+      # WSL: keep the download on the Windows side so Add-AppxPackage can read it.
+      wt="$(ps '[IO.Path]::GetTempPath()' 2>/dev/null)" || wt=""
+      [ -z "$wt" ] || base="$(wslpath -u "$wt" 2>/dev/null || echo "$base")"
+    fi
+    tmpdir="$(mktemp -d "${base%/}/msixrun.XXXXXX")" || die "could not create a temp directory"
+    name="${src%%[?#]*}"; name="${name##*/}"
+    name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+    has_pkg_ext "$name" || name="download.msix"
+    file="$tmpdir/$name"
+    echo "Downloading $src ..."
+    curl -fsSL -o "$file" "$src" || die "download failed: $src"
+    ;;
+  *)
+    file="$src"
+    [ -f "$file" ] || die "file not found: $file"
+    has_pkg_ext "$file" || die "expected a .msix, .msixbundle, .appx or .appxbundle file: $file"
+    ;;
+esac
+
+# Convert to a Windows path.
 if command -v cygpath >/dev/null 2>&1; then
   winpath="$(cygpath -w "$file")"
 elif command -v wslpath >/dev/null 2>&1; then
@@ -48,53 +295,129 @@ elif command -v wslpath >/dev/null 2>&1; then
 else
   die "need cygpath (Git Bash/MSYS2) or wslpath (WSL) to convert the path"
 fi
-psq="${winpath//\'/\'\'}"   # escape single quotes for PowerShell
 
-# 2. Read the package name from the manifest inside the package (it is a zip).
+# ---- 2. read the package identity from the manifest (the package is a zip) ----
+
 echo "Reading package manifest..."
-pkgname="$(ps "
-\$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-\$zip = [IO.Compression.ZipFile]::OpenRead('$psq')
-try {
-  \$e = \$zip.Entries | Where-Object { \$_.FullName -in 'AppxManifest.xml','AppxMetadata/AppxBundleManifest.xml' } | Select-Object -First 1
-  if (-not \$e) { throw 'no AppxManifest.xml or AppxBundleManifest.xml found in package' }
-  \$r = New-Object IO.StreamReader(\$e.Open())
-  try { [xml]\$x = \$r.ReadToEnd() } finally { \$r.Dispose() }
-  if (\$x.Package) { \$x.Package.Identity.Name } else { \$x.Bundle.Identity.Name }
-} finally { \$zip.Dispose() }
-")" || die "could not read the package manifest"
+run_ps ps_manifest
+[ "$rc" -eq 0 ] || die "could not read the package manifest: $out"
+pkgname="$(field NAME)"
 [ -n "$pkgname" ] || die "could not determine package name from manifest"
+case "$pkgname" in
+  *[!A-Za-z0-9.-]*) die "refusing a package name with unexpected characters" ;;
+esac
 echo "Package: $pkgname"
 
-# 3. Install.
-echo "Installing $winpath ..."
-if ! ps "Add-AppxPackage -Path '$psq'" >&2; then
-  cat >&2 <<HINT
+# ---- 3. install, with one fix per known problem ----
 
-msixrun: install failed. If the message above mentions a signature or certificate
-(e.g. 0x800B0100), the package is probably unsigned or signed by an untrusted cert:
-  - Enable Developer Mode: Settings > System > For developers (Windows 11).
-  - Unsigned packages can only be installed on recent Windows builds that support
-    'Add-AppxPackage -AllowUnsigned' (run it manually in an elevated PowerShell).
-  - Or sign the package and trust its certificate.
+allow_unsigned=0
+msg=""
+in_out() { printf '%s\n' "$out" | grep -qiE "$1"; }
+
+# Windows' own wording for each failure; codes come from the exception text.
+UNTRUSTED='0x800B0109|0x800B010A|0x800B0112|0x800B0004|root certificate of the signature|chain.*cannot be built'
+UNSIGNED='0x800B0100|must be digitally signed|not signed'
+
+trust_done=0 unsigned_done=0 conflict_done=0
+while :; do
+  echo "Installing $winpath ..."
+  run_ps ps_install "\$allowUnsigned = [bool]$allow_unsigned"
+  if [ "$rc" -eq 0 ] && in_out '^MSIXRUN_OK'; then break; fi
+  msg="$(field MSIXRUN_MESSAGE)"; [ -n "$msg" ] || msg="$out"
+
+  # 3a. The publisher is not trusted.
+  if in_out "$UNTRUSTED" && [ "$trust_done" -eq 0 ]; then
+    run_ps ps_signer
+    subject="$(field SUBJECT)"; thumb="$(field THUMBPRINT)"; notafter="$(field NOTAFTER)"
+    if [ -z "$thumb" ]; then
+      die "Windows does not trust this package's publisher, and msixrun could not read the signer certificate: $msg"
+    fi
+    {
+      echo
+      echo "Signer:      $subject"
+      echo "Thumbprint:  $thumb (SHA-1)"
+      echo "Valid until: $notafter"
+    } >&2
+    if confirm "Windows does not trust the publisher of this package. Trust $subject and install? [y/N]" trust; then
+      echo "Windows will ask for permission once (UAC)." >&2
+      run_ps ps_trust
+      case "$(field MSIXRUN_RESULT)" in
+        ok) echo "Trusted $subject on this PC (Local Machine, Trusted People)." >&2 ;;
+        declined) die "permission was declined, so $subject was not trusted. Nothing was changed." ;;
+        nocert) die "the package has no signer certificate to trust" ;;
+        unverified) die "the certificate import ran but the thumbprint is not in Trusted People. Nothing was installed." ;;
+        *) die "could not trust the certificate: $(field MSIXRUN_MESSAGE)" ;;
+      esac
+      trust_done=1
+      continue
+    else
+      case $? in
+        2) die "Windows does not trust the publisher of this package ($subject) and there is no terminal to ask. Re-run with --trust to trust this publisher, or --yes to answer yes to everything." ;;
+        *) die "not installed: you chose not to trust $subject" ;;
+      esac
+    fi
+  fi
+
+  # 3b. The package is not signed at all.
+  if in_out "$UNSIGNED" && [ "$unsigned_done" -eq 0 ]; then
+    run_ps ps_devmode
+    devmode="$(field DEVMODE)"; canunsigned="$(field ALLOWUNSIGNED)"
+    if [ "$devmode" = 1 ] && [ "$canunsigned" = 1 ]; then
+      if confirm "This package is not signed. Developer Mode is on, so it can be installed unsigned. Install it anyway? [y/N]" yes; then
+        allow_unsigned=1; unsigned_done=1
+        continue
+      else
+        case $? in
+          2) die "this package is not signed. Re-run with --yes to install it unsigned (Developer Mode is on)." ;;
+          *) die "not installed: you chose not to install an unsigned package" ;;
+        esac
+      fi
+    elif [ "$devmode" = 1 ]; then
+      die "this package is not signed, and this version of Windows cannot install unsigned packages. Sign it, or use a newer Windows build."
+    else
+      cat >&2 <<HINT
+msixrun: this package is not signed, and Developer Mode is off.
+Turn Developer Mode on, then run this again:
+  Windows 11: Settings > System > For developers > Developer Mode
+  Windows 10: Settings > Update & Security > For developers > Developer Mode
 HINT
+      exit 1
+    fi
+  fi
+
+  # 3c. An older copy from a different publisher is in the way.
+  if [ "$conflict_done" -eq 0 ]; then
+    run_ps ps_conflict
+    if [ "$(field CONFLICT)" -gt 0 ] 2>/dev/null; then
+      if confirm "An older $pkgname from a different publisher is installed. Remove it and install this one? Its local data will be removed. [y/N]" yes; then
+        run_ps ps_remove
+        [ "$rc" -eq 0 ] || die "could not remove the older $pkgname: $(field MSIXRUN_MESSAGE)"
+        conflict_done=1
+        continue
+      else
+        case $? in
+          2) die "an older $pkgname from a different publisher is installed. Re-run with --yes to remove it (its local data is removed) and install this one." ;;
+          *) die "not installed: you chose to keep the older $pkgname" ;;
+        esac
+      fi
+    fi
+  fi
+
+  echo "msixrun: install failed: $msg" >&2
   exit 1
-fi
+done
 
-[ "$launch" -eq 1 ] || { echo "Installed $pkgname."; exit 0; }
+if [ "$launch" -ne 1 ]; then echo "Installed $pkgname."; exit 0; fi
 
-# 4. Look up PackageFamilyName and the first app Id, then launch.
-info="$(ps "
-\$ErrorActionPreference = 'Stop'
-\$p = Get-AppxPackage -Name '$pkgname' | Sort-Object { [version]\$_.Version } | Select-Object -Last 1
-if (-not \$p) { throw 'package not found after install' }
-\$id = @((Get-AppxPackageManifest \$p).Package.Applications.Application)[0].Id
-if (-not \$id) { throw 'package declares no launchable application' }
-\$p.PackageFamilyName + '!' + \$id
-")" || die "installed, but could not find the app to launch"
-[ -n "$info" ] || die "installed, but could not resolve PackageFamilyName!AppId"
+# ---- 4. look up PackageFamilyName and the first app Id, then launch ----
+
+run_ps ps_launch
+[ "$rc" -eq 0 ] || die "installed, but could not find the app to launch: $out"
+info="$(printf '%s\n' "$out" | tail -n 1)"
+case "$info" in
+  ""|*[!A-Za-z0-9._!-]*|!*|*!) die "installed, but could not resolve PackageFamilyName!AppId" ;;
+esac
 
 echo "Launching $info"
 # explorer.exe often returns a nonzero exit code even on success.
-explorer.exe "shell:AppsFolder\$info" || true
+explorer.exe "shell:AppsFolder\\$info" || true

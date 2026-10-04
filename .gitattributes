@@ -1,2 +1,4 @@
 *.sh text eol=lf
 msixrun text eol=lf
+*.ps1 text eol=lf
+*.psd1 text eol=lf
