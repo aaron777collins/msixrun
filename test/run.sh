@@ -161,6 +161,15 @@ new_test "package name with shell or PowerShell metacharacters is refused"
 printf 'NAME=Evil$(touch %s/pwned);x\nPUBLISHER=CN=X\n' "$T" >"$T/manifest.out"
 run_msixrun app.msix
 assert_rc 1; assert_out "unexpected characters"; [ ! -e "$T/pwned" ] && ok || bad "package-derived string was executed"
+new_test "path with wildcard characters is copied to a plain name first"
+cp "$T/app.msix" "$T/app[1]*?.msix"; run_msixrun 'app[1]*?.msix' --no-launch
+assert_rc 0; assert_file_has "$T/script.install.1" 'C:\fake\app_1___.msix'
+assert_file_has "$T/script.manifest.1" 'C:\fake\app_1___.msix'
+[ -z "$(ls "$T/tmp")" ] && ok || bad "temp copy not cleaned up: $(ls "$T/tmp")"
+new_test "path without wildcard characters is used in place"
+run_msixrun app.msix --no-launch
+assert_rc 0; assert_file_has "$T/script.install.1" "\$pkg = 'C:\\fake\\app.msix'"
+[ -z "$(ls "$T/tmp")" ] && ok || bad "temp dir created needlessly"
 new_test "path with single quotes is escaped for PowerShell"
 cp "$T/app.msix" "$T/it's.msix"; run_msixrun "it's.msix" --no-launch
 assert_rc 0; assert_file_has "$T/script.install.1" "C:\\fake\\it''s.msix"
@@ -223,8 +232,15 @@ assert_out "Valid until: 2030-01-02"
 assert_steps "manifest install signer trust install launch"
 assert_file_has "$T/script.trust.1" "LocalMachine\\TrustedPeople"
 assert_file_has "$T/script.trust.1" "-EncodedCommand"
+assert_file_has "$T/script.trust.1" 'ToBase64String($cert.RawData)'
+assert_file_has "$T/script.trust.1" '$c.Thumbprint -ne'
 assert_file_has "$T/script.trust.1" "-Verb RunAs -Wait -PassThru"
 assert_file_has "$T/script.trust.1" "\$pkg = 'C:\\fake\\app.msix'"
+new_test "trust script writes no certificate file and imports no file by path"
+printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; answers y; run_msixrun app.msix
+for banned in Export-Certificate Import-Certificate .cer GetTempPath; do
+  if grep -qF -- "$banned" "$T/script.trust.1"; then bad "trust script mentions $banned"; else ok; fi
+done
 new_test "trust script never touches the Root store"
 printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; answers y; run_msixrun app.msix
 if grep -qiE 'Cert:.LocalMachine.Root|-CertStoreLocation[^|]*Root|\\Root\b' "$T/script.trust.1"; then bad "script mentions the Root store"; else ok; fi
@@ -278,6 +294,18 @@ printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
 printf 'MSIXRUN_RESULT=unverified\n' >"$T/trust.out"; echo 5 >"$T/trust.rc"
 run_msixrun app.msix --trust
 assert_rc 1; assert_out "not in Trusted People"; assert_count install 1
+for st in HashMismatch NotSigned Incompatible NotSupportedFileFormat; do
+  new_test "signature status $st is not offered for trust"
+  printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
+  printf 'STATUS=%s\nSUBJECT=CN=Acme Ltd, O=Acme\nTHUMBPRINT=AABB\nNOTAFTER=2030-01-02\n' "$st" >"$T/signer.out"
+  run_msixrun app.msix --yes
+  assert_rc 1; assert_out "signature is not valid (status: $st)"; assert_no_step trust; assert_count install 1
+done
+new_test "signature status NotTrusted is offered for trust"
+printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
+printf 'STATUS=NotTrusted\nSUBJECT=CN=Acme Ltd, O=Acme\nTHUMBPRINT=AABB\nNOTAFTER=2030-01-02\n' >"$T/signer.out"
+run_msixrun app.msix --trust --no-launch
+assert_rc 0; assert_step trust
 new_test "package with no signer certificate"
 printf '%s\nok\n' "$UNTRUSTED" >"$T/install.seq"; no_tty
 printf 'STATUS=NotSigned\n' >"$T/signer.out"
@@ -336,9 +364,18 @@ assert_steps "manifest install conflict remove install"
 new_test "older copy, error 0x80073CF3"
 printf '0x80073CF3\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers y
 run_msixrun app.msix --no-launch; assert_rc 0; assert_step remove
-new_test "older copy found even when the error code is unfamiliar"
+new_test "unfamiliar error never offers to remove an older copy, even when one exists"
 printf '0x80073D06\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers y
-run_msixrun app.msix --no-launch; assert_rc 0; assert_step remove
+run_msixrun app.msix --no-launch
+assert_rc 1; assert_out "install failed"; assert_no_step conflict; assert_no_step remove; assert_not_out "Remove it"
+new_test "unfamiliar error with --yes never removes an older copy"
+printf '0x80070070\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
+run_msixrun app.msix --yes --no-launch
+assert_rc 1; assert_no_step remove; assert_count install 1
+new_test "trust succeeds, retry fails for another reason, older copy exists: nothing removed"
+printf '%s\n0x80070070\n' "$UNTRUSTED" >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; no_tty
+run_msixrun app.msix --yes --no-launch
+assert_rc 1; assert_step trust; assert_no_step remove; assert_out "install failed"
 new_test "older copy, user says n"
 printf '0x80073CFB\nok\n' >"$T/install.seq"; printf 'CONFLICT=1\n' >"$T/conflict.out"; answers n
 run_msixrun app.msix

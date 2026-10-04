@@ -5,7 +5,7 @@
 .DESCRIPTION
   msixrun 1.1.0. Works in Windows PowerShell 5.1 and PowerShell 7.
 
-  Run it straight from the web, nothing saved, no execution policy change:
+  Run it straight from the web (the script itself is not saved, no execution policy change):
 
     & ([scriptblock]::Create((irm https://raw.githubusercontent.com/aaron777collins/msixrun/main/msixrun.ps1))) <path-or-url> [-NoLaunch] [-Trust] [-Yes]
 
@@ -43,6 +43,12 @@ $script:MsixrunVersion = '1.1.0'
 # Windows' own wording for each failure; the codes come from the exception text.
 $script:UntrustedPattern = '0x800B0109|0x800B010A|0x800B0112|0x800B0004|root certificate of the signature|chain.*cannot be built'
 $script:UnsignedPattern  = '0x800B0100|must be digitally signed|not signed'
+# Only these mean "another publisher's copy is in the way". Anything else
+# (disk full, bad dependency, corrupt package) must never lead to a removal.
+$script:ConflictPattern  = '0x80073CFB|0x80073CF3'
+# Signature statuses that mean "validly signed, chain not trusted". Anything
+# else (HashMismatch, NotSigned, ...) is not offered for trust.
+$script:TrustableStatuses = @('UnknownError', 'NotTrusted')
 
 function Show-MsixrunUsage {
     Write-Host @"
@@ -216,6 +222,7 @@ function Get-SignerInfo {
     $c = $sig.SignerCertificate
     if (-not $c) { return $null }
     return [pscustomobject]@{
+        Status      = [string]$sig.Status
         Certificate = $c
         Subject     = [regex]::Replace([string]$c.Subject, '\p{Cc}+', ' ')
         Thumbprint  = [regex]::Replace([string]$c.Thumbprint, '\p{Cc}+', ' ')
@@ -239,32 +246,39 @@ function Test-UacDeclined {
     return $false
 }
 
-# Export THIS package's signer certificate and import it into
-# LocalMachine\TrustedPeople in one elevated child. The child's command is
-# passed as -EncodedCommand (Base64 of UTF-16LE), so no text is ever parsed as
-# part of a command line. Never the Root store.
+# The script run by the elevated child. It carries the certificate bytes
+# itself (Base64 of the DER data) and refuses to import anything whose
+# thumbprint is not the expected one, so no file on disk is ever trusted.
+function Get-CertVerifyScript {
+    param([byte[]]$RawData, [string]$Thumbprint)
+    $b64 = [Convert]::ToBase64String($RawData)
+    return '$ErrorActionPreference = ''Stop''; try { $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String(''' + $b64 + ''')); if ($c.Thumbprint -ne ''' + (ConvertTo-PsQuoted $Thumbprint) + ''') { exit 1 }; '
+}
+
+function Get-CertImportScript {
+    return '$s = New-Object Security.Cryptography.X509Certificates.X509Store ''TrustedPeople'', ''LocalMachine''; $s.Open(''ReadWrite''); try { $s.Add($c) } finally { $s.Close() } } catch { exit 1 }'
+}
+
+# Import THIS package's signer certificate into LocalMachine\TrustedPeople in
+# one elevated child. The child's command is passed as -EncodedCommand (Base64
+# of UTF-16LE), so no text is ever parsed as part of a command line. Never the
+# Root store.
 function Add-SignerTrust {
     param($Signer)
-    $cer = Join-Path ([IO.Path]::GetTempPath()) ('msixrun-' + [guid]::NewGuid().ToString('N') + '.cer')
+    $inner = (Get-CertVerifyScript -RawData $Signer.Certificate.RawData -Thumbprint $Signer.Thumbprint) + (Get-CertImportScript)
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
     try {
-        Export-Certificate -Cert $Signer.Certificate -FilePath $cer -Type CERT | Out-Null
-        $inner = '$ErrorActionPreference = ''Stop''; try { Import-Certificate -FilePath ''' + (ConvertTo-PsQuoted $cer) + ''' -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null } catch { exit 1 }'
-        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-        try {
-            $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ErrorAction Stop `
-                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
-        } catch {
-            if (Test-UacDeclined $_.Exception) {
-                Write-MsixrunFatal "permission was declined, so $($Signer.Subject) was not trusted. Nothing was changed."
-            }
-            Write-MsixrunFatal "could not start the elevated step: $($_.Exception.Message)"
+        $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ErrorAction Stop `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
+    } catch {
+        if (Test-UacDeclined $_.Exception) {
+            Write-MsixrunFatal "permission was declined, so $($Signer.Subject) was not trusted. Nothing was changed."
         }
-        if ($p.ExitCode -ne 0) { Write-MsixrunFatal "could not trust the certificate: the elevated import exited with code $($p.ExitCode)" }
-        if (-not (Test-Path -LiteralPath ('Cert:\LocalMachine\TrustedPeople\' + $Signer.Thumbprint))) {
-            Write-MsixrunFatal 'the certificate import ran but the thumbprint is not in Trusted People. Nothing was installed.'
-        }
-    } finally {
-        Remove-Item -LiteralPath $cer -Force -ErrorAction SilentlyContinue
+        Write-MsixrunFatal "could not start the elevated step: $($_.Exception.Message)"
+    }
+    if ($p.ExitCode -ne 0) { Write-MsixrunFatal "could not trust the certificate: the elevated import exited with code $($p.ExitCode)" }
+    if (-not (Test-Path -LiteralPath ('Cert:\LocalMachine\TrustedPeople\' + $Signer.Thumbprint))) {
+        Write-MsixrunFatal 'the certificate import ran but the thumbprint is not in Trusted People. Nothing was installed.'
     }
 }
 
@@ -304,6 +318,9 @@ function Invoke-Msixrun {
             if ($failure -match $script:UntrustedPattern -and -not $trustDone) {
                 $signer = Get-SignerInfo -Path $pkg
                 if (-not $signer) { Write-MsixrunFatal "Windows does not trust this package's publisher, and msixrun could not read the signer certificate: $failure" }
+                if ($script:TrustableStatuses -notcontains $signer.Status) {
+                    Write-MsixrunFatal "the package's signature is not valid (status: $($signer.Status)), so msixrun will not offer to trust it. Get a fresh copy of the package. $failure"
+                }
                 Write-Host ''
                 Write-Host "Signer:      $($signer.Subject)"
                 Write-Host "Thumbprint:  $($signer.Thumbprint) (SHA-1)"
@@ -343,7 +360,7 @@ function Invoke-Msixrun {
             }
 
             # 3c. An older copy from a different publisher is in the way.
-            if (-not $conflictDone) {
+            if (-not $conflictDone -and $failure -match $script:ConflictPattern) {
                 $old = @(Get-ConflictingPackage -Id $id)
                 if ($old.Count -gt 0) {
                     $ok = Confirm-Msixrun -Prompt "An older $name from a different publisher is installed. Remove it and install this one? Its local data will be removed. [y/N]" `

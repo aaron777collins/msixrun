@@ -104,15 +104,17 @@ if ($c) {
 PS
 }
 
-# Export THIS package's signer certificate and import it into
-# LocalMachine\TrustedPeople in one elevated child. The child's command is
-# passed as -EncodedCommand (Base64 of UTF-16LE), so no text is ever parsed
-# as part of a command line.
+# Import THIS package's signer certificate into LocalMachine\TrustedPeople in
+# one elevated child. The certificate bytes travel inside the child's command
+# (Base64 of the DER data, checked against the expected thumbprint before the
+# import), so no file on disk is ever trusted. The command is passed as
+# -EncodedCommand (Base64 of UTF-16LE), so no text is parsed as part of a
+# command line.
 ps_trust() {
   cat <<'PS'
 # step: trust
 $ErrorActionPreference = 'Stop'
-function Q($s) { [regex]::Replace($s, '([''\u2018\u2019\u201A\u201B])', '$1$1') }
+function Q($s) { [regex]::Replace($s, '([''‘’‚‛])', '$1$1') }
 function Declined($e) {
   while ($e) {
     if (($e -is [ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 1223) -or $e.Message -match 'cancell?ed by the user') { return $true }
@@ -123,25 +125,20 @@ function Declined($e) {
 $sig = Get-AuthenticodeSignature -FilePath $pkg
 $cert = $sig.SignerCertificate
 if (-not $cert) { 'MSIXRUN_RESULT=nocert'; exit 2 }
-$cer = Join-Path ([IO.Path]::GetTempPath()) ('msixrun-' + [guid]::NewGuid().ToString('N') + '.cer')
+$b64 = [Convert]::ToBase64String($cert.RawData)
+$inner = '$ErrorActionPreference = ''Stop''; try { $c = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String(''' + $b64 + ''')); if ($c.Thumbprint -ne ''' + (Q $cert.Thumbprint) + ''') { exit 1 }; $s = New-Object Security.Cryptography.X509Certificates.X509Store ''TrustedPeople'', ''LocalMachine''; $s.Open(''ReadWrite''); try { $s.Add($c) } finally { $s.Close() } } catch { exit 1 }'
+$enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
 try {
-  Export-Certificate -Cert $cert -FilePath $cer -Type CERT | Out-Null
-  $inner = '$ErrorActionPreference = ''Stop''; try { Import-Certificate -FilePath ''' + (Q $cer) + ''' -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null } catch { exit 1 }'
-  $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-  try {
-    $p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
-  } catch {
-    if (Declined $_.Exception) { 'MSIXRUN_RESULT=declined'; exit 3 }
-    'MSIXRUN_RESULT=failed'
-    'MSIXRUN_MESSAGE=' + ($_.Exception.Message -replace '\s+', ' ')
-    exit 4
-  }
-  if ($p.ExitCode -ne 0) { 'MSIXRUN_RESULT=failed'; 'MSIXRUN_MESSAGE=the elevated import exited with code ' + $p.ExitCode; exit 4 }
-  if (-not (Test-Path ('Cert:\LocalMachine\TrustedPeople\' + $cert.Thumbprint))) { 'MSIXRUN_RESULT=unverified'; exit 5 }
-  'MSIXRUN_RESULT=ok'
-} finally {
-  Remove-Item -LiteralPath $cer -Force -ErrorAction SilentlyContinue
+  $p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
+} catch {
+  if (Declined $_.Exception) { 'MSIXRUN_RESULT=declined'; exit 3 }
+  'MSIXRUN_RESULT=failed'
+  'MSIXRUN_MESSAGE=' + ($_.Exception.Message -replace '\s+', ' ')
+  exit 4
 }
+if ($p.ExitCode -ne 0) { 'MSIXRUN_RESULT=failed'; 'MSIXRUN_MESSAGE=the elevated import exited with code ' + $p.ExitCode; exit 4 }
+if (-not (Test-Path ('Cert:\LocalMachine\TrustedPeople\' + $cert.Thumbprint))) { 'MSIXRUN_RESULT=unverified'; exit 5 }
+'MSIXRUN_RESULT=ok'
 PS
 }
 
@@ -263,16 +260,21 @@ tmpdir=""
 cleanup() { [ -z "$tmpdir" ] || rm -rf "$tmpdir"; }
 trap cleanup EXIT
 
+make_tmpdir() {
+  [ -z "$tmpdir" ] || return 0
+  local base="${TMPDIR:-/tmp}" wt
+  if ! command -v cygpath >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+    # WSL: keep the files on the Windows side so Add-AppxPackage can read them.
+    wt="$(ps '[IO.Path]::GetTempPath()' 2>/dev/null)" || wt=""
+    [ -z "$wt" ] || base="$(wslpath -u "$wt" 2>/dev/null || echo "$base")"
+  fi
+  tmpdir="$(mktemp -d "${base%/}/msixrun.XXXXXX")" || die "could not create a temp directory"
+}
+
 case "$src" in
   http://*|https://*)
     command -v curl >/dev/null 2>&1 || die "curl is required to download a package URL"
-    base="${TMPDIR:-/tmp}"
-    if ! command -v cygpath >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
-      # WSL: keep the download on the Windows side so Add-AppxPackage can read it.
-      wt="$(ps '[IO.Path]::GetTempPath()' 2>/dev/null)" || wt=""
-      [ -z "$wt" ] || base="$(wslpath -u "$wt" 2>/dev/null || echo "$base")"
-    fi
-    tmpdir="$(mktemp -d "${base%/}/msixrun.XXXXXX")" || die "could not create a temp directory"
+    make_tmpdir
     name="${src%%[?#]*}"; name="${name##*/}"
     name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
     has_pkg_ext "$name" || name="download.msix"
@@ -284,6 +286,16 @@ case "$src" in
     file="$src"
     [ -f "$file" ] || die "file not found: $file"
     has_pkg_ext "$file" || die "expected a .msix, .msixbundle, .appx or .appxbundle file: $file"
+    # Add-AppxPackage -Path and Get-AuthenticodeSignature -FilePath treat
+    # [ ] * ? as wildcards, so work from a plain copy.
+    case "$file" in
+      *[][*?]*)
+        make_tmpdir
+        copy="$tmpdir/$(printf '%s' "${file##*/}" | tr -c 'A-Za-z0-9._-' '_')"
+        cp -- "$file" "$copy" || die "could not copy $file to a temp directory"
+        file="$copy"
+        ;;
+    esac
     ;;
 esac
 
@@ -317,6 +329,9 @@ in_out() { printf '%s\n' "$out" | grep -qiE "$1"; }
 # Windows' own wording for each failure; codes come from the exception text.
 UNTRUSTED='0x800B0109|0x800B010A|0x800B0112|0x800B0004|root certificate of the signature|chain.*cannot be built'
 UNSIGNED='0x800B0100|must be digitally signed|not signed'
+# Only these mean another publisher's copy is in the way. Any other failure
+# (disk full, bad dependency, corrupt package) must never lead to a removal.
+CONFLICT='0x80073CFB|0x80073CF3'
 
 trust_done=0 unsigned_done=0 conflict_done=0
 while :; do
@@ -328,10 +343,16 @@ while :; do
   # 3a. The publisher is not trusted.
   if in_out "$UNTRUSTED" && [ "$trust_done" -eq 0 ]; then
     run_ps ps_signer
+    status="$(field STATUS)"
     subject="$(field SUBJECT)"; thumb="$(field THUMBPRINT)"; notafter="$(field NOTAFTER)"
     if [ -z "$thumb" ]; then
       die "Windows does not trust this package's publisher, and msixrun could not read the signer certificate: $msg"
     fi
+    # Only a valid signature with an untrusted chain is offered for trust.
+    case "$status" in
+      UnknownError|NotTrusted) ;;
+      *) die "the package's signature is not valid (status: ${status:-unknown}), so msixrun will not offer to trust it. Get a fresh copy of the package. $msg" ;;
+    esac
     {
       echo
       echo "Signer:      $subject"
@@ -386,7 +407,7 @@ HINT
   fi
 
   # 3c. An older copy from a different publisher is in the way.
-  if [ "$conflict_done" -eq 0 ]; then
+  if [ "$conflict_done" -eq 0 ] && in_out "$CONFLICT"; then
     run_ps ps_conflict
     if [ "$(field CONFLICT)" -gt 0 ] 2>/dev/null; then
       if confirm "An older $pkgname from a different publisher is installed. Remove it and install this one? Its local data will be removed. [y/N]" yes; then

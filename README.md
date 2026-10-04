@@ -16,7 +16,7 @@ Paste this into PowerShell, with the package's address or path at the end:
 ```
 
 - Works in Windows PowerShell 5.1 (the one built into Windows) and PowerShell 7.
-- Nothing is saved to disk and your execution policy is not changed.
+- The script itself is not saved to disk and your execution policy is not changed. A package address is downloaded to a temporary folder, and a package path containing `[ ] * ?` is copied there; both are deleted when msixrun finishes.
 - You do not need Git Bash.
 
 Add switches after the address:
@@ -63,11 +63,14 @@ install fails with an error such as `0x800B0109`. msixrun then:
 
 1. Reads the signer of this package and shows its name, SHA-1 thumbprint and expiry date.
 2. Asks: `Windows does not trust the publisher of this package. Trust <name> and install? [y/N]`
-3. On yes, saves that one certificate to a temporary `.cer` file and imports it into the
-   **Local Machine, Trusted People** store. This needs administrator rights, so Windows shows
-   one permission (UAC) prompt.
-4. Checks the certificate is now in Trusted People, deletes the temporary file, and tries the
-   install again once.
+3. Only if the signature is valid but its chain is not trusted (status `UnknownError` or
+   `NotTrusted`). A package whose signature is broken (for example `HashMismatch`) is refused, and
+   nothing is offered for trust.
+4. On yes, passes that one certificate's bytes inside the elevated command and imports it into the
+   **Local Machine, Trusted People** store. The elevated step first checks the bytes match the
+   thumbprint you were shown. This needs administrator rights, so Windows shows one permission
+   (UAC) prompt. No certificate file is written to disk.
+5. Checks the certificate is now in Trusted People and tries the install again.
 
 What this does and does not do:
 
@@ -88,14 +91,21 @@ What this does and does not do:
 - **An older copy from a different publisher.** Windows will not update an app across
   publishers. msixrun asks: `An older <name> from a different publisher is installed. Remove it
   and install this one? Its local data will be removed. [y/N]` and, on yes, removes it and installs.
+  It asks only when Windows reports the publisher conflict (`0x80073CFB` or `0x80073CF3`) and a
+  copy from a different publisher is installed. Any other install error is shown as it is, and
+  nothing is removed, even with `-Yes`.
 - **Downloads.** For a URL, msixrun downloads the file to a temporary folder and deletes it
   afterwards (TLS 1.2 is forced on Windows PowerShell 5.1).
+- **Paths with `[ ] * ?`.** Windows treats these as wildcards, so msixrun installs from a plain
+  copy in a temporary folder and deletes it afterwards.
 
 ## How it works
 
 1. Gets the package (local path, or download from the URL).
 2. Reads the package name from the manifest inside the package (it is a zip).
-3. Runs `Add-AppxPackage`. If that fails, it fixes the one thing that went wrong (above) and retries.
+3. Runs `Add-AppxPackage`. If that fails, it recognizes the failure, fixes that one thing (trust
+   the publisher, install unsigned, or remove an older copy from another publisher, each once and
+   each with your consent) and retries. A failure it does not recognize is shown and stops.
 4. Looks up the installed `PackageFamilyName` and the first app `Id`, and launches with
    `explorer.exe "shell:AppsFolder\<PFN>!<AppId>"`.
 
@@ -108,12 +118,14 @@ a Base64 `-EncodedCommand`.
 
 ```bash
 bash test/run.sh                          # Bash version, with stubbed powershell.exe, curl and friends
-pwsh -File tests/Invoke-Tests.ps1         # PowerShell version, Pester 5
+pwsh -File tests/Invoke-Tests.ps1         # PowerShell version and the Bash version's PowerShell snippets (parsed; the manifest one is run), Pester 5
 pwsh -File tests/Invoke-Lint.ps1          # PSScriptAnalyzer, incl. Windows PowerShell 5.1 syntax
 shellcheck msixrun install.sh test/run.sh
 ```
 
-The Pester tests mock every Windows command, so they also run on macOS and Linux.
+The Pester tests mock every Windows command, so they also run on macOS and Linux. That means they
+do not prove the real Windows behavior (exception shapes, UAC, `Add-AppxPackage` under Windows
+PowerShell 5.1 and PowerShell 7). Run it once on a real Windows machine before a release.
 
 ## License
 
