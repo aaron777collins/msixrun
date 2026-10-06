@@ -117,7 +117,7 @@ UNTRUSTED='0x800B0109'
 new_test "help"
 run_msixrun --help; assert_rc 0; assert_out "--trust"; assert_out "--yes"; assert_out "--no-launch"; assert_out "http(s) URL"
 new_test "version"
-run_msixrun --version; assert_rc 0; assert_out "msixrun 1.1.0"
+run_msixrun --version; assert_rc 0; assert_out "msixrun 1.1.1"
 new_test "no arguments prints usage and fails"
 run_msixrun; assert_rc 1; assert_out "Usage:"
 new_test "unknown option"

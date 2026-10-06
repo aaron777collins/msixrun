@@ -2,7 +2,7 @@
 # msixrun - install and launch an MSIX/APPX package from bash on Windows.
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 usage() {
   cat <<USAGE

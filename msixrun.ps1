@@ -3,7 +3,7 @@
   Install and launch an MSIX/APPX package, and trust its publisher if you say so.
 
 .DESCRIPTION
-  msixrun 1.1.0. Works in Windows PowerShell 5.1 and PowerShell 7.
+  msixrun 1.1.1. Works in Windows PowerShell 5.1 and PowerShell 7.
 
   Run it straight from the web (the script itself is not saved, no execution policy change):
 
@@ -38,7 +38,7 @@ param(
     [switch]$Help
 )
 
-$script:MsixrunVersion = '1.1.0'
+$script:MsixrunVersion = '1.1.1'
 
 # Failures are classified on the deployment HRESULT that Windows prints in its
 # message ("Deployment failed with HRESULT: 0x..."), after the package path and
@@ -156,13 +156,27 @@ function Get-ExceptionCode {
     return @([regex]::Matches($Text.Substring($i), '0x[0-9A-Fa-f]{8}') | ForEach-Object { $_.Value.ToUpperInvariant() })
 }
 
-# Does the failure text belong to a kind? The message's code decides when there
-# is one. With no code in the message, the wording decides, or an exception
-# HResult that is itself one of the kind's codes.
+# The inner detail codes in a message, written "error 0x........:" by Windows.
+# Only the message part counts (never the exception part), and the package path
+# is already stripped from the text, so a file name cannot supply one. Used only
+# for the untrusted and unsigned kinds, never for the publisher conflict.
+function Get-DetailCode {
+    param([string]$Text)
+    $msg = $Text.Split([string[]]@($script:ExceptionMarker), 'None')[0]
+    return @([regex]::Matches($msg, '\berror\s+(0x[0-9A-Fa-f]{8})\s*:') | ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() })
+}
+
+# Does the failure text belong to a kind? The message's code (or an inner
+# detail code) decides when there is one. With no code in the message, the
+# wording decides, or an exception HResult that is itself one of the kind's codes.
 function Test-FailureKind {
     param([string]$Failure, [string[]]$Codes, [string]$Wording)
     $code = Get-FailureCode $Failure
-    if ($code) { return ($Codes -contains $code) }
+    if ($code -and ($Codes -contains $code)) { return $true }
+    # Windows often reports the cause inside a generic deployment HRESULT such
+    # as 0x80073CF0, as "error 0x800B0109: ..." detail in the message.
+    if (@(Get-DetailCode $Failure | Where-Object { $Codes -contains $_ }).Count -gt 0) { return $true }
+    if ($code) { return $false }
     if (@(Get-ExceptionCode $Failure | Where-Object { $Codes -contains $_ }).Count -gt 0) { return $true }
     return ($Failure.Split([string[]]@($script:ExceptionMarker), 'None')[0] -match $Wording)
 }

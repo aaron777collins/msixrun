@@ -607,7 +607,7 @@ Describe 'msixrun.ps1' {
         It 'prints the version from a saved file and exits 0' {
             $o = & $script:Pwsh -NoProfile -File $script:ScriptPath -Version
             $LASTEXITCODE | Should -Be 0
-            "$o" | Should -Match 'msixrun 1\.1\.0'
+            "$o" | Should -Match 'msixrun 1\.1\.1'
         }
         It 'prints usage and exits 1 with no arguments' {
             $o = & $script:Pwsh -NoProfile -File $script:ScriptPath
@@ -724,6 +724,32 @@ Describe 'msixrun.ps1 helpers' {
         Test-FailureKind 'HRESULT: 0x80070070 root certificate of the signature' $c $w | Should -BeFalse
         Test-FailureKind 'root certificate of the signature must be trusted [exception HResult: 0x80131500]' $c $w | Should -BeTrue
         Test-FailureKind 'plain [exception HResult: 0x800B0109]' $c $w | Should -BeTrue
+    }
+    It 'Test-FailureKind: an inner "error 0x........:" detail code inside 0x80073CF0 is untrusted (fl-b0b1)' {
+        $msg = 'Deployment failed with HRESULT: 0x80073CF0, Package could not be opened. error 0x800B0109: The root certificate of the signature in the app package or bundle must be trusted. NOTE: For additional information, look for [ActivityId] a8ba589d-5430-0003-e822-73ad3054dd01 in the Event Log or use the command line Get-AppPackageLog -ActivityID a8ba589d-5430-0003-e822-73ad3054dd01 error 0x800B0109: The root certificate of the signature in the app package or bundle must be trusted. DeploymentError,Microsoft.Windows.Appx.PackageManager.Commands.AddAppxPackageCommand'
+        $text = try { throw $msg } catch { Get-FailureText $_ -Path 'C:\Users\me\Downloads\app.msix' }
+        $text = $text -replace '\[exception HResult:.*$', '[exception HResult: 0x80070002 0x80073CF0]'
+        Get-FailureCode $text | Should -Be '0X80073CF0'
+        Test-FailureKind $text $script:UntrustedCodes $script:UntrustedWording | Should -BeTrue
+        Test-FailureKind $text $script:UnsignedCodes $script:UnsignedWording | Should -BeFalse
+        Test-PublisherConflict $text | Should -BeFalse
+    }
+    It 'Test-FailureKind: an inner 0x800B0100 detail inside 0x80073CF0 is unsigned, not untrusted' {
+        $text = 'Deployment failed with HRESULT: 0x80073CF0, Package could not be opened. error 0x800B0100: The app package must be digitally signed. [exception HResult: 0x80070002 0x80073CF0]'
+        Test-FailureKind $text $script:UnsignedCodes $script:UnsignedWording | Should -BeTrue
+        Test-FailureKind $text $script:UntrustedCodes $script:UntrustedWording | Should -BeFalse
+    }
+    It 'Test-FailureKind: an inner detail code in the exception part or a package file name does not count' {
+        $c = $script:UntrustedCodes; $w = $script:UntrustedWording
+        Test-FailureKind 'HRESULT: 0x80073CF0, x [exception HResult: error 0x800B0109: y]' $c $w | Should -BeFalse
+        $p = 'C:\d\error 0x800B0109 .msix'
+        $text = try { throw ('HRESULT: 0x80073CF0, could not open ' + $p) } catch { Get-FailureText $_ -Path $p }
+        Test-FailureKind $text $c $w | Should -BeFalse
+    }
+    It 'Test-PublisherConflict ignores inner detail codes, so removal stays conservative' {
+        Test-PublisherConflict 'HRESULT: 0x80073CF0, x error 0x80073CFB: conflicts with y [exception HResult: 0x80073CF0]' | Should -BeFalse
+        Test-PublisherConflict 'HRESULT: 0x80073CF0, x error 0x80073CF3: conflicts with y [exception HResult: 0x80073CF0]' | Should -BeFalse
+        Test-PublisherConflict 'HRESULT: 0x80073CFB, x [exception HResult: 0x80073CF0]' | Should -BeTrue
     }
 }
 
